@@ -95,13 +95,13 @@ int mschapv2_verify_authenticator_response(
 
 /* Derive the 64-byte EAP-MSCHAPv2 MSK per RFC 3079.
  *   MasterKey  = SHA1(PasswordHashHash || NTResponse || MagicConstant1)
- *   SendKey16  = GetAsymmetricStartKey(MasterKey, 16, server-to-client)
- *   RecvKey16  = GetAsymmetricStartKey(MasterKey, 16, client-to-server)
- *   MSK        = SendKey16 || RecvKey16 || 32 zero bytes (per RFC 3748)
+ *   SendKey16  = GetAsymmetricStartKey(MasterKey, 16, client-to-server)
+ *   RecvKey16  = GetAsymmetricStartKey(MasterKey, 16, server-to-client)
+ *   MSK        = RecvKey16 || SendKey16 || 32 zero bytes (per RFC 3748)
  *
- * Note RFC 3748 sec.7.10 specifies how the EAP MSK is built from
- * MSCHAPv2 keys; we follow the "client" perspective: send = MS-MPPE-
- * Recv-Key, recv = MS-MPPE-Send-Key, then 32 zero bytes.
+ * RFC 3748 sec.7.10 builds the EAP MSK from the MSCHAPv2 keys. From the
+ * client perspective, client send uses the client-to-server key and
+ * client receive uses the server-to-client key.
  */
 int mschapv2_derive_msk(const char *password, size_t pw_len,
                         const uint8_t nt_response[MSCHAPV2_NT_RESPONSE_LEN],
