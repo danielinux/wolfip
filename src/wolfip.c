@@ -4922,9 +4922,12 @@ static int tcp_process_ts(struct tsocket *t, const struct wolfIP_tcp_seg *tcp,
      * until then there is no reference to compare against. A zeroed last_ts
      * is not a timestamp - treating it as one makes every segment whose
      * TSval sits in the upper half of the 32-bit space look "older" and
-     * tcp_paws_check drops the whole data flow after the handshake. */
+     * tcp_paws_check drops the whole data flow after the handshake.
+     * last_ts is stored in wire order (it is emitted verbatim as ECR),
+     * so compare in host order as tcp_paws_check does: byte-swapped
+     * values are not ordered. */
     if (!t->sock.tcp.ts_recent_valid ||
-            (!tcp_seq_lt(ee32(po.ts_val), t->sock.tcp.last_ts) &&
+            (!tcp_seq_lt(po.ts_val, ee32(t->sock.tcp.last_ts)) &&
              tcp_seq_leq(ee32(tcp->seq), t->sock.tcp.ack))) {
         t->sock.tcp.last_ts = ee32(po.ts_val);
         t->sock.tcp.ts_recent_valid = 1;
