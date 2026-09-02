@@ -1823,6 +1823,64 @@ START_TEST(test_dhcp_dad_reply_for_other_ip_ignored)
 }
 END_TEST
 
+/* During DAD, a spoofed reply (sip = 0.0.0.0) arriving on an unconfigured
+ * secondary interface must not force a conflict on the primary lease: the
+ * DAD hook is bound to the probing interface and the recorded candidate,
+ * not the receiving interface's (zero) address. */
+START_TEST(test_dhcp_dad_reply_on_unconfigured_secondary_ignored)
+{
+    struct wolfIP s;
+    struct dhcp_msg msg;
+    struct arp_packet reply;
+    struct wolfIP_ll_dev *ll;
+    struct ipconf *primary;
+    uint32_t server_ip = 0x0A000001U;
+    uint32_t client_ip = 0x0A000064U;
+    uint8_t other_mac[6] = {0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0x03};
+
+    /* Primary holds the candidate; the secondary is left unconfigured so
+     * its conf->ip is IPADDR_ANY (the trap the old check fell into). */
+    setup_stack_with_two_ifaces(&s, client_ip, 0x0A010001U);
+    wolfIP_ipconf_at(&s, TEST_SECOND_IF)->ip = IPADDR_ANY;
+    s.dhcp_xid = 0xDA06U;
+    s.dhcp_state = DHCP_REQUEST_SENT;
+    s.last_tick = 1000U;
+    primary = wolfIP_primary_ipconf(&s);
+    ck_assert_ptr_nonnull(primary);
+    primary->ip = client_ip;
+
+    build_full_ack(&s, &msg, server_ip, client_ip, 0xFFFFFF00U,
+                   server_ip, 0x08080808U, 120U);
+    ck_assert_int_eq(dhcp_parse_ack(&s, &msg, sizeof(msg)), 0);
+    ck_assert_int_eq(s.dhcp_state, DHCP_DAD);
+
+    /* A spoofed reply with a zero sender IP on the unconfigured secondary:
+     * the old check (sip == conf->ip) saw 0 == 0 and forced a conflict on
+     * the primary lease. The DAD hook must stay on the probing interface. */
+    ll = wolfIP_getdev_ex(&s, TEST_SECOND_IF);
+    ck_assert_ptr_nonnull(ll);
+    memset(&reply, 0, sizeof(reply));
+    memcpy(reply.eth.dst, ll->mac, 6);
+    memcpy(reply.eth.src, other_mac, 6);
+    reply.eth.type = ee16(ETH_TYPE_ARP);
+    reply.htype = ee16(1);
+    reply.ptype = ee16(0x0800);
+    reply.hlen = 6;
+    reply.plen = 4;
+    reply.opcode = ee16(ARP_REPLY);
+    memcpy(reply.sma, other_mac, 6);
+    reply.sip = ee32(IPADDR_ANY);
+    reply.tip = ee32(client_ip);
+
+    arp_recv(&s, TEST_SECOND_IF, &reply, sizeof(reply));
+
+    /* No conflict: DAD continues, the primary lease is intact. */
+    ck_assert_int_eq(s.dhcp_state, DHCP_DAD);
+    ck_assert_uint_eq(s.dhcp_dad_probes, 1U);
+    ck_assert_uint_eq(primary->ip, client_ip);
+}
+END_TEST
+
 /* Real ll drivers (stm32, lpc, fman, gem, tap) return the frame length on
  * send success, not 0. The DAD probe counter must treat any non-negative
  * return as "sent"; otherwise the first probe is miscounted, a fourth probe

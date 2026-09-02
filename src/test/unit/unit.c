@@ -1478,6 +1478,7 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_core, test_dhcp_dad_conflict_releases_and_rediscover);
     tcase_add_test(tc_core, test_dhcp_dad_own_mac_reply_ignored);
     tcase_add_test(tc_core, test_dhcp_dad_reply_for_other_ip_ignored);
+    tcase_add_test(tc_core, test_dhcp_dad_reply_on_unconfigured_secondary_ignored);
     tcase_add_test(tc_core, test_dhcp_dad_single_dhcp_timer_in_heap);
     tcase_add_test(tc_core, test_dhcp_dad_probe_count_len_returning_driver);
     tcase_add_test(tc_core, test_dhcp_decline_wire_format);

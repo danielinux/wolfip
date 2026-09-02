@@ -1464,6 +1464,7 @@ struct wolfIP {
     uint32_t dhcp_timer; /* Timer for DHCP */
     uint32_t dhcp_timeout_count; /* DHCP timeout counter */
     uint8_t dhcp_dad_probes; /* DAD probes sent (0 = DAD inactive) */
+    uint8_t dhcp_dad_if; /* Interface DAD probes on (valid in DHCP_DAD) */
     ip4 dhcp_server_ip; /* DHCP server IP */
     ip4 dhcp_ip; /* IP address assigned by DHCP */
     uint32_t dhcp_offered_mask; /* netmask from the accepted OFFER */
@@ -9138,6 +9139,7 @@ static int dhcp_parse_ack(struct wolfIP *s, struct dhcp_msg *msg, uint32_t msg_l
          * arp_recv (dhcp_dad_conflict). */
         s->dhcp_state = DHCP_DAD;
         s->dhcp_dad_probes = 0;
+        s->dhcp_dad_if = WOLFIP_PRIMARY_IF_IDX;
         /* Arm the lease absolutes, then swap the renew timer for
          * the DAD timer: handle_timers() fires every expired
          * entry, so leaving both in the heap would double-fire
@@ -9859,10 +9861,12 @@ static void arp_recv(struct wolfIP *s, unsigned int if_idx, void *buf, int len)
     else if (arp->opcode == ee16(ARP_REPLY)) {
         ip4 sip = ee32(arp->sip);
         int pending;
-        /* RFC 4331 DAD: a reply claiming the address being probed means
-         * it is in use, unless it came from our own MAC (looped probe).
-         * This is the one case where a reply for our own IP is acted on. */
-        if (s->dhcp_state == DHCP_DAD && sip == conf->ip) {
+        /* RFC 4331 DAD: a reply on the probing interface claiming the
+         * candidate is a conflict, unless it is our own MAC (looped probe).
+         * Bound to the DAD interface + recorded candidate so a reply on
+         * another (e.g. unconfigured) interface cannot force one. */
+        if (s->dhcp_state == DHCP_DAD && if_idx == s->dhcp_dad_if &&
+                sip == s->dhcp_ip) {
             if (memcmp(arp->sma, ll->mac, 6) != 0)
                 dhcp_dad_conflict(s);
             return;
