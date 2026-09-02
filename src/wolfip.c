@@ -8712,7 +8712,8 @@ static void dhcp_deconfigure_lease(struct wolfIP *s)
  * RFC 2132 §9.3: option 52 (Overload) tells the client that the reply's
  * sname (value bit 2) and/or file (value bit 1) fields carry additional
  * options, interpreted after the standard options field is exhausted.
- * The stream is therefore scanned options -> sname -> file (wire order),
+ * The stream is therefore scanned options -> file -> sname (RFC 2131
+ * sec.4.4.1: the file field is interpreted next, followed by sname),
  * each region with its own bounds, and ends at option 255 or when the
  * last active region runs out. Non-overloaded sname/file fields hold
  * plain strings (TFTP server, bootfile) and are never scanned. */
@@ -8751,24 +8752,24 @@ static void dhcp_opt_stream_init(struct dhcp_opt_stream *st,
 static int dhcp_opt_stream_next_region(struct dhcp_opt_stream *st)
 {
     if (st->region == 0) {
+        if (st->overload & 1) {
+            st->region = 2;
+            st->ptr = st->region_file;
+            st->end = st->region_file_end;
+            return 1;
+        }
         if (st->overload & 2) {
             st->region = 1;
             st->ptr = st->region_sname;
             st->end = st->region_sname_end;
             return 1;
         }
-        if (st->overload & 1) {
-            st->region = 2;
-            st->ptr = st->region_file;
-            st->end = st->region_file_end;
-            return 1;
-        }
     }
-    else if (st->region == 1) {
-        if (st->overload & 1) {
-            st->region = 2;
-            st->ptr = st->region_file;
-            st->end = st->region_file_end;
+    else if (st->region == 2) {
+        if (st->overload & 2) {
+            st->region = 1;
+            st->ptr = st->region_sname;
+            st->end = st->region_sname_end;
             return 1;
         }
     }
