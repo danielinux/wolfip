@@ -5888,3 +5888,34 @@ START_TEST(test_tcp_fin_in_close_wait_does_not_advance_ack)
     ck_assert_uint_eq(lsn->sock.tcp.ack, rcv_nxt + 1);
 }
 END_TEST
+
+/* When the timer heap is full, tcp_ctrl_rto_start must not mark the
+ * control RTO active: an active flag with no timer behind it would never
+ * fire and would suppress every other timeout. */
+START_TEST(test_tcp_ctrl_rto_start_no_timer_does_not_set_active)
+{
+    struct wolfIP s;
+    struct tsocket *ts;
+    struct wolfIP_timer t = {0};
+    int i;
+
+    wolfIP_init(&s);
+    t.cb = tcp_rto_cb;
+    for (i = 0; i < MAX_TIMERS; i++) {
+        t.arg = (void *)(intptr_t)i;
+        t.expires = s.last_tick + 1000 + i;
+        timers_binheap_insert(&s.timers, t);
+    }
+    ts = &s.tcpsockets[0];
+    ts->S = &s;
+    ts->proto = WI_IPPROTO_TCP;
+    ts->sock.tcp.rto = 1000;
+    ts->sock.tcp.ctrl_rto_retries = 0;
+    ts->sock.tcp.tmr_rto = NO_TIMER;
+    ts->sock.tcp.ctrl_rto_active = 0;
+    tcp_ctrl_rto_start(ts, s.last_tick);
+    /* Heap full: insert failed, so the control RTO must not be active. */
+    ck_assert_int_eq(ts->sock.tcp.tmr_rto, NO_TIMER);
+    ck_assert_int_eq(ts->sock.tcp.ctrl_rto_active, 0);
+}
+END_TEST

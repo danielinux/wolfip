@@ -1348,7 +1348,7 @@ static void tcp_persist_start(struct tsocket *t, uint64_t now);
 static void tcp_persist_stop(struct tsocket *t);
 static void tcp_rto_update_from_sample(struct tsocket *t, uint32_t sample_ms);
 static void tcp_rto_cb(void *arg);
-static void tcp_ctrl_rto_start(struct tsocket *t, uint64_t now);
+static int tcp_ctrl_rto_start(struct tsocket *t, uint64_t now);
 static void tcp_ctrl_rto_stop(struct tsocket *t);
 static void tcp_fin_wait_2_timeout_start(struct tsocket *t, uint64_t now);
 static void tcp_fin_wait_2_timeout_stop(struct tsocket *t);
@@ -4006,12 +4006,12 @@ static uint32_t tcp_backoff_rto_ms(uint32_t rto_ms, uint32_t retries)
 
 /* Arm/re-arm control-RTO timer using exponential backoff over the current base RTO.
  * This path is dedicated to SYN/SYN-ACK/FIN reliability (not data-loss recovery). */
-static void tcp_ctrl_rto_start(struct tsocket *t, uint64_t now)
+static int tcp_ctrl_rto_start(struct tsocket *t, uint64_t now)
 {
     struct wolfIP_timer tmr = {0};
     uint64_t shift_rto;
     if (!t || t->proto != WI_IPPROTO_TCP)
-        return;
+        return 0;
     /* The control RTO takes over the shared timer slot: tcp_rto_cb
      * dispatches on the timeout flags from that same slot, so every flag
      * it replaces must be cleared with the timer it armed. */
@@ -4026,7 +4026,14 @@ static void tcp_ctrl_rto_start(struct tsocket *t, uint64_t now)
     tmr.arg = t;
     tmr.cb = tcp_rto_cb;
     t->sock.tcp.tmr_rto = timers_binheap_insert(&t->S->timers, tmr);
+    /* Only mark the control RTO active when the timer actually took a slot:
+     * an active flag with no timer behind it would never fire and would
+     * suppress every other timeout until a later event cleared it. */
+    if (t->sock.tcp.tmr_rto == NO_TIMER) {
+        return -1;
+    }
     t->sock.tcp.ctrl_rto_active = 1;
+    return 0;
 }
 
 static void tcp_fin_wait_2_timeout_start(struct tsocket *t, uint64_t now)
