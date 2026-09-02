@@ -6409,6 +6409,34 @@ packet_try:
     return -1;
 }
 
+/* Forward declaration: defined below, used by port_alloc_random. */
+static int bind_port_in_use(const struct tsocket *arr, int n,
+                            const struct tsocket *self,
+                            ip4 new_local_ip, uint16_t new_port);
+
+/* Pick a source port (or ICMP id) that no other socket in arr claims.
+ * Start from a random value >= min_port, then walk forward on a
+ * collision (wrapping to min_port). local_ip may be IPADDR_ANY when the
+ * route is not resolved yet; the check then compares ports only. */
+static uint16_t port_alloc_random(const struct tsocket *arr, int n,
+                                  const struct tsocket *self,
+                                  ip4 local_ip, uint16_t min_port)
+{
+    uint16_t port;
+    uint16_t tries;
+    port = (uint16_t)(wolfIP_getrandom() & 0xFFFF);
+    if (port < min_port)
+        port += min_port;
+    for (tries = 0; tries < 16; tries++) {
+        if (!bind_port_in_use(arr, n, self, local_ip, port))
+            return port;
+        port++;
+        if (port < min_port)
+            port = min_port;
+    }
+    return port;
+}
+
 int wolfIP_sock_connect(struct wolfIP *s, int sockfd, const struct wolfIP_sockaddr *addr,
                         socklen_t addrlen)
 {
@@ -6581,7 +6609,8 @@ int wolfIP_sock_connect(struct wolfIP *s, int sockfd, const struct wolfIP_sockad
         ts->if_idx = new_if_idx;
         ts->local_ip = new_local_ip;
         if (!ts->src_port)
-            ts->src_port = (uint16_t)(wolfIP_getrandom() & 0xFFFF);
+            ts->src_port = port_alloc_random(s->tcpsockets, MAX_TCPSOCKETS,
+                                             ts, ts->local_ip, 1024);
         if (ts->src_port < 1024)
             ts->src_port += 1024;
         ts->dst_port = ee16(sin->sin_port);
@@ -6840,11 +6869,9 @@ int wolfIP_sock_sendto(struct wolfIP *s, int sockfd, const void *buf, size_t len
         }
         if ((ts->dst_port==0) || (ts->remote_ip==0))
             return -1;
-        if (ts->src_port == 0) {
-            ts->src_port = (uint16_t)(wolfIP_getrandom() & 0xFFFF);
-            if (ts->src_port < 1024)
-                ts->src_port += 1024;
-        }
+        if (ts->src_port == 0)
+            ts->src_port = port_alloc_random(s->udpsockets, MAX_UDPSOCKETS,
+                                             ts, IPADDR_ANY, 1024);
         if_idx = wolfIP_route_for_ip(s, ts->remote_ip);
 #ifdef IP_MULTICAST
         if (wolfIP_ip_is_multicast(ts->remote_ip) && ts->sock.udp.mcast_if_set)
@@ -6900,11 +6927,9 @@ int wolfIP_sock_sendto(struct wolfIP *s, int sockfd, const void *buf, size_t len
         }
         if (ts->remote_ip == 0)
             return -1;
-        if (ts->src_port == 0) {
-            ts->src_port = (uint16_t)(wolfIP_getrandom() & 0xFFFF);
-            if (ts->src_port == 0)
-                ts->src_port = 1;
-        }
+        if (ts->src_port == 0)
+            ts->src_port = port_alloc_random(s->icmpsockets, MAX_ICMPSOCKETS,
+                                             ts, IPADDR_ANY, 1);
         if (ts->bound_local_ip != IPADDR_ANY) {
             int bound_match = 0;
             unsigned int bound_if = wolfIP_if_for_local_ip(s, ts->bound_local_ip, &bound_match);

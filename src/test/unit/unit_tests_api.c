@@ -1507,6 +1507,54 @@ START_TEST(test_sock_bind_udp_src_port_nonzero)
 }
 END_TEST
 
+/* An auto-assigned UDP source port must not collide with a port already
+ * bound by another socket: the allocator must skip in-use ports. With the
+ * RNG pinned to 5000 (the bound port), the fix walks forward to 5001. */
+START_TEST(test_udp_auto_port_skips_in_use)
+{
+    struct wolfIP s;
+    int udp_sd1, udp_sd2;
+    struct tsocket *ts2;
+    struct wolfIP_sockaddr_in sin;
+    const char payload[] = "test";
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    wolfIP_ipconfig_set(&s, 0x0A000001U, 0xFFFFFF00U, 0);
+
+    /* Bind the first UDP socket to port 5000. */
+    udp_sd1 = wolfIP_sock_socket(&s, AF_INET, IPSTACK_SOCK_DGRAM, WI_IPPROTO_UDP);
+    ck_assert_int_gt(udp_sd1, 0);
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = ee16(5000);
+    sin.sin_addr.s_addr = ee32(0x0A000001U);
+    ck_assert_int_eq(wolfIP_sock_bind(&s, udp_sd1,
+                    (struct wolfIP_sockaddr *)&sin, sizeof(sin)), 0);
+
+    /* Pin the RNG to 5000 (the bound port); the auto allocator must walk
+     * forward to 5001 instead of colliding. */
+    test_rand_override_enabled = 1;
+    test_rand_override_value = 5000U;
+
+    /* Create a second UDP socket and sendto (auto-assigns a source port). */
+    udp_sd2 = wolfIP_sock_socket(&s, AF_INET, IPSTACK_SOCK_DGRAM, WI_IPPROTO_UDP);
+    ck_assert_int_gt(udp_sd2, 0);
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = ee16(9999);
+    sin.sin_addr.s_addr = ee32(0x0A000002U);
+    ck_assert_int_ge(wolfIP_sock_sendto(&s, udp_sd2, payload, sizeof(payload), 0,
+                                        (const struct wolfIP_sockaddr *)&sin,
+                                        sizeof(sin)), 0);
+    test_rand_override_enabled = 0;
+
+    /* The auto port must be 5001 (not the bound 5000). */
+    ts2 = &s.udpsockets[SOCKET_UNMARK(udp_sd2)];
+    ck_assert_uint_eq(ts2->src_port, 5001U);
+}
+END_TEST
+
 START_TEST(test_sock_bind_udp_filter_blocks)
 {
     struct wolfIP s;

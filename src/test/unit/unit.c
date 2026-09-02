@@ -211,6 +211,7 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_utils, test_sock_bind_tcp_filter_blocks);
     tcase_add_test(tc_utils, test_sock_bind_tcp_port_collision_rejected);
     tcase_add_test(tc_utils, test_sock_bind_udp_src_port_nonzero);
+    tcase_add_test(tc_utils, test_udp_auto_port_skips_in_use);
     tcase_add_test(tc_utils, test_sock_bind_udp_filter_blocks);
     tcase_add_test(tc_utils, test_sock_bind_icmp_success);
     tcase_add_test(tc_utils, test_sock_connect_wrong_family);
