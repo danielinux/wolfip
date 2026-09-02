@@ -406,6 +406,53 @@ START_TEST(test_filter_notify_udp_ihl_truncated_no_overread)
 }
 END_TEST
 
+START_TEST(test_filter_notify_raw_tx_eth_header_built)
+{
+    struct wolfIP s;
+    struct wolfIP_sockaddr_in dst;
+    uint8_t payload[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+    uint8_t bcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    int raw_sd;
+    int ret;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    wolfIP_ipconfig_set(&s, 0x0A000001U, 0xFFFFFF00U, 0);
+
+    filter_cb_calls = 0;
+    memset(&filter_last_event, 0, sizeof(filter_last_event));
+    wolfIP_filter_set_callback(test_filter_cb, NULL);
+    wolfIP_filter_set_mask(WOLFIP_FILT_MASK(WOLFIP_FILT_SENDING));
+
+    raw_sd = wolfIP_sock_socket(&s, AF_INET, IPSTACK_SOCK_RAW, WI_IPPROTO_UDP);
+    ck_assert_int_ge(raw_sd, 0);
+
+    /* Limited broadcast: the nexthop MAC is all-ones, so the flush
+     * path needs no ARP entry. */
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = ee32(0xFFFFFFFFU);
+
+    ret = wolfIP_sock_sendto(&s, raw_sd, payload, sizeof(payload), 0,
+            (struct wolfIP_sockaddr *)&dst, sizeof(dst));
+    ck_assert_int_eq(ret, (int)sizeof(payload));
+
+    (void)wolfIP_poll(&s, 0);
+
+    wolfIP_filter_set_callback(NULL, NULL);
+    wolfIP_sock_close(&s, raw_sd);
+
+    /* The eth event must carry the header the frame was actually sent
+     * with: all-ones destination, the interface MAC as source. */
+    ck_assert_int_ge(filter_cb_calls, 1);
+    ck_assert_uint_eq(filter_last_event.meta.ip_proto,
+                      WOLFIP_FILTER_PROTO_ETH);
+    ck_assert_int_eq(memcmp(filter_last_event.meta.dst_mac, bcast_mac, 6), 0);
+    ck_assert_int_eq(memcmp(filter_last_event.meta.src_mac,
+            wolfIP_ll_at(&s, TEST_PRIMARY_IF)->mac, 6), 0);
+}
+END_TEST
+
 
 START_TEST(test_filter_dispatch_no_callback)
 {

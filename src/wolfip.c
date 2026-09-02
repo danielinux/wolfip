@@ -11761,15 +11761,26 @@ static void flush_raw_tx(struct wolfIP *s)
                 ip->csum = 0;
                 iphdr_set_checksum(ip);
             }
-            if (wolfIP_filter_notify_ip(WOLFIP_FILT_SENDING, s, tx_if, ip, desc->len) != 0)
+#ifdef ETHERNET
+            /* Build the ethernet header before the filter callbacks run:
+             * they may inspect the destination address the frame will
+             * actually carry. */
+            if (!wolfIP_ll_is_non_ethernet(s, tx_if)) {
+                if (eth_output_add_header(s, tx_if, r->nexthop_mac, &ip->eth,
+                        ETH_TYPE_IP) != 0) {
+                    break;
+                }
+            }
+#endif
+            if (wolfIP_filter_notify_ip(WOLFIP_FILT_SENDING, s, tx_if, ip, desc->len) != 0) {
                 break;
+            }
 #ifdef ETHERNET
             if (!wolfIP_ll_is_non_ethernet(s, tx_if)) {
                 if (wolfIP_filter_notify_eth(WOLFIP_FILT_SENDING, s, tx_if,
-                            &ip->eth, desc->len) != 0)
+                            &ip->eth, desc->len) != 0) {
                     break;
-                eth_output_add_header(s, tx_if, r->nexthop_mac, &ip->eth,
-                        ETH_TYPE_IP);
+                }
             }
 #endif
             /* Mirror flush_datagram_tx: on driver backpressure/hard error
