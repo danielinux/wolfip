@@ -10994,14 +10994,14 @@ static void dns_cancel_timer(struct wolfIP *s)
     }
 }
 
-static void dns_schedule_timer(struct wolfIP *s)
+static int dns_schedule_timer(struct wolfIP *s)
 {
     struct wolfIP_timer tmr = { };
     uint64_t interval = DNS_QUERY_TIMEOUT;
     uint8_t shift;
 
     if (!s)
-        return;
+        return -1;
     if (s->dns_retry_count == 0) {
         /* RFC 1035 recommends a 2s initial retransmission interval. On embedded
          * targets, add a small 0..390 ms random offset to 1800 ms so many
@@ -11019,6 +11019,9 @@ static void dns_schedule_timer(struct wolfIP *s)
     tmr.arg = s;
     tmr.cb = dns_timeout_cb;
     s->dns_timer = timers_binheap_insert(&s->timers, tmr);
+    if (s->dns_timer == NO_TIMER)
+        return -1;
+    return 0;
 }
 
 static int dns_resend_query(struct wolfIP *s)
@@ -11070,7 +11073,10 @@ static void dns_timeout_cb(void *arg)
             return;
         }
         s->dns_retry_count++;
-        dns_schedule_timer(s);
+        if (dns_schedule_timer(s) != 0) {
+            dns_abort_query(s);
+            return;
+        }
     } else {
         dns_abort_query(s);
     }
@@ -11282,7 +11288,14 @@ static int dns_send_query(struct wolfIP *s, const char *dname, uint16_t *id,
         *id = DNS_ID_NONE;
         return ret;
     }
-    dns_schedule_timer(s);
+    if (dns_schedule_timer(s) != 0) {
+        /* Timer heap full: abort the armed query, or the busy guard
+         * (dns_id != 0) would block every later lookup with no timer to
+         * clear it. */
+        dns_abort_query(s);
+        *id = DNS_ID_NONE;
+        return -1;
+    }
     return 0;
 }
 

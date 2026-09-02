@@ -3169,6 +3169,37 @@ START_TEST(test_dns_send_query_schedules_timeout)
 }
 END_TEST
 
+/* When the timer heap is full, dns_send_query must abort the armed query
+ * (clearing dns_id) and return an error: a failed timeout insert would
+ * leave the DNS busy guard (dns_id != 0) set with no timer to clear it,
+ * wedging the resolver for every later lookup. */
+START_TEST(test_dns_send_query_timer_heap_full_aborts)
+{
+    struct wolfIP s;
+    struct wolfIP_timer t;
+    uint16_t id = 0;
+    int i;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    s.dns_server = 0x08080808U;
+    s.last_tick = 100U;
+
+    /* Fill the timer heap so the DNS timeout insert fails. */
+    for (i = 0; i < MAX_TIMERS; i++) {
+        t.expires = s.last_tick + 1000U + (uint64_t)i;
+        t.arg = NULL;
+        t.cb = NULL;
+        (void)timers_binheap_insert(&s.timers, t);
+    }
+
+    /* The query must abort (dns_id cleared) rather than wedge the resolver. */
+    ck_assert_int_ne(dns_send_query(&s, "example.com", &id, DNS_A), 0);
+    ck_assert_uint_eq(s.dns_id, 0U);
+    ck_assert_uint_eq(s.dns_timer, NO_TIMER);
+}
+END_TEST
+
 START_TEST(test_dns_send_query_send_failure_clears_outstanding_state)
 {
     struct wolfIP s;
