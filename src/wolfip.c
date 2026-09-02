@@ -4011,7 +4011,11 @@ static void tcp_ctrl_rto_start(struct tsocket *t, uint64_t now)
     uint64_t shift_rto;
     if (!t || t->proto != WI_IPPROTO_TCP)
         return;
+    /* The control RTO takes over the shared timer slot: tcp_rto_cb
+     * dispatches on the timeout flags from that same slot, so every flag
+     * it replaces must be cleared with the timer it armed. */
     t->sock.tcp.fin_wait_2_timeout_active = 0;
+    t->sock.tcp.preaccept_timeout_active = 0;
     if (t->sock.tcp.tmr_rto != NO_TIMER) {
         timer_binheap_cancel(&t->S->timers, t->sock.tcp.tmr_rto);
         t->sock.tcp.tmr_rto = NO_TIMER;

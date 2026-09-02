@@ -5766,3 +5766,67 @@ START_TEST(test_tcp_listener_revert_restores_option_baseline)
     ck_assert_uint_eq(lsn->sock.tcp.ts_offer, fresh->sock.tcp.ts_offer);
 }
 END_TEST
+
+/* A handshake that completes before accept() leaves the listener
+ * ESTABLISHED with the pre-accept fast-fail timer armed. If the
+ * application closes the socket instead of accepting, the control RTO
+ * takes over the shared timer slot and must keep retransmitting the
+ * FIN-ACK on every expiry. The pre-accept flag has to go with the timer
+ * it armed: left behind, tcp_rto_cb's pre-accept branch sees a socket
+ * that left the pinned condition, disarms quietly, and the FIN_WAIT_1
+ * close stalls with no retransmit and no retry budget. */
+START_TEST(test_tcp_listener_preaccept_close_rto_retransmits_finack)
+{
+    struct wolfIP s;
+    int fd;
+    struct tsocket *lsn;
+    uint64_t t;
+    uint32_t frames_before;
+    const struct wolfIP_tcp_seg *out;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    wolfIP_ipconfig_set(&s, LLK_LOCAL_IP, LLK_NET_MASK, 0);
+    fd = llk_open_listener(&s);
+    lsn = &s.tcpsockets[SOCKET_UNMARK(fd)];
+
+    /* Pending-only ARP policy: the peer is a known neighbor, so the
+     * FIN-ACK retransmits reach the wire. */
+    llk_keep_arp_fresh(&s, LLK_ATT_IP);
+
+    llk_attacker_syn(&s, LLK_ATT_IP, 41000, 1, 0);
+    llk_complete_handshake(&s, lsn, LLK_ATT_IP, 41000, 1);
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_ESTABLISHED);
+    ck_assert_int_eq(lsn->sock.tcp.preaccept_timeout_active, 1);
+
+    /* Close the established-but-unaccepted connection: FIN_WAIT_1, the
+     * control RTO owns the timer slot, and the pre-accept flag must be
+     * gone with the timer it armed. */
+    ck_assert_int_eq(wolfIP_sock_close(&s, fd), -WOLFIP_EAGAIN);
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_FIN_WAIT_1);
+    ck_assert_int_eq(lsn->sock.tcp.preaccept_timeout_active, 0);
+    ck_assert_int_eq(lsn->sock.tcp.ctrl_rto_active, 1);
+    ck_assert_uint_ne(lsn->sock.tcp.tmr_rto, NO_TIMER);
+
+    /* First poll drains the queued FIN-ACK. */
+    (void)wolfIP_poll(&s, 3);
+    out = llk_last_tcp();
+    ck_assert_ptr_nonnull(out);
+    ck_assert(out->flags & (TCP_FLAG_FIN | TCP_FLAG_ACK));
+
+    /* The control RTO fires: the FIN-ACK is retransmitted and the
+     * backoff re-armed, not silently disarmed. */
+    frames_before = last_frame_sent_count;
+    for (t = 4; t <= 2500; t += 100) {
+        (void)wolfIP_poll(&s, t);
+    }
+    ck_assert_uint_eq(last_frame_sent_count, frames_before + 1);
+    out = llk_last_tcp();
+    ck_assert_ptr_nonnull(out);
+    ck_assert(out->flags & (TCP_FLAG_FIN | TCP_FLAG_ACK));
+    ck_assert_uint_eq(ee16(out->src_port), LLK_LISTEN_PORT);
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_FIN_WAIT_1);
+    ck_assert_int_eq(lsn->sock.tcp.ctrl_rto_active, 1);
+    ck_assert_uint_ne(lsn->sock.tcp.tmr_rto, NO_TIMER);
+}
+END_TEST
