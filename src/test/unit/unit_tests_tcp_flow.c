@@ -5830,3 +5830,61 @@ START_TEST(test_tcp_listener_preaccept_close_rto_retransmits_finack)
     ck_assert_uint_ne(lsn->sock.tcp.tmr_rto, NO_TIMER);
 }
 END_TEST
+
+/* An acceptable FIN that arrives in CLOSE_WAIT or CLOSING does not move
+ * the state machine: the peer's FIN was already consumed on the way in.
+ * It must not advance the receive ACK either, or a peer that keeps
+ * sending FINs at RCV.NXT would march the ACK forward with no state
+ * change. */
+START_TEST(test_tcp_fin_in_close_wait_does_not_advance_ack)
+{
+    struct wolfIP s;
+    int fd;
+    struct tsocket *lsn;
+    uint8_t seg_buf[sizeof(struct wolfIP_tcp_seg)];
+    struct wolfIP_tcp_seg *fin = (struct wolfIP_tcp_seg *)seg_buf;
+    uint32_t rcv_nxt;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    wolfIP_ipconfig_set(&s, LLK_LOCAL_IP, LLK_NET_MASK, 0);
+    fd = llk_open_listener(&s);
+    lsn = &s.tcpsockets[SOCKET_UNMARK(fd)];
+
+    llk_keep_arp_fresh(&s, LLK_ATT_IP);
+
+    llk_attacker_syn(&s, LLK_ATT_IP, 41000, 1, 0);
+    llk_complete_handshake(&s, lsn, LLK_ATT_IP, 41000, 1);
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_ESTABLISHED);
+    rcv_nxt = lsn->sock.tcp.ack;
+
+    /* The peer's FIN at RCV.NXT: ESTABLISHED -> CLOSE_WAIT, ACK advances. */
+    memset(seg_buf, 0, sizeof(seg_buf));
+    fin->ip.ver_ihl = 0x45;
+    fin->ip.proto = WI_IPPROTO_TCP;
+    fin->ip.ttl = 64;
+    fin->ip.len = ee16(IP_HEADER_LEN + TCP_HEADER_LEN);
+    fin->ip.src = ee32(lsn->remote_ip);
+    fin->ip.dst = ee32(lsn->local_ip);
+    fin->dst_port = ee16(lsn->src_port);
+    fin->src_port = ee16(lsn->dst_port);
+    fin->seq = ee32(rcv_nxt);
+    fin->ack = ee32(tcp_seq_inc(lsn->sock.tcp.snd_una, 1));
+    fin->hlen = TCP_HEADER_LEN << 2;
+    fin->flags = TCP_FLAG_FIN | TCP_FLAG_ACK;
+    fix_tcp_checksums(fin);
+    tcp_input(&s, TEST_PRIMARY_IF, fin,
+              (uint32_t)(ETH_HEADER_LEN + IP_HEADER_LEN + TCP_HEADER_LEN));
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_CLOSE_WAIT);
+    ck_assert_uint_eq(lsn->sock.tcp.ack, rcv_nxt + 1);
+
+    /* A second FIN at the new RCV.NXT: no state change in CLOSE_WAIT,
+     * and the receive ACK must not advance. */
+    fin->seq = ee32(rcv_nxt + 1);
+    fix_tcp_checksums(fin);
+    tcp_input(&s, TEST_PRIMARY_IF, fin,
+              (uint32_t)(ETH_HEADER_LEN + IP_HEADER_LEN + TCP_HEADER_LEN));
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_CLOSE_WAIT);
+    ck_assert_uint_eq(lsn->sock.tcp.ack, rcv_nxt + 1);
+}
+END_TEST

@@ -5917,6 +5917,7 @@ static void tcp_input(struct wolfIP *S, unsigned int if_idx,
                     uint32_t seq = ee32(tcp->seq);
                     uint32_t fin_seq_end = tcp_seq_inc(seq, tcplen);
                     int accept_fin = 1;
+                    int transitioned = 0;
 
                     if ((tcplen == 0 && t->sock.tcp.ack != seq) ||
                         (tcplen > 0 && t->sock.tcp.ack != fin_seq_end)) {
@@ -5929,18 +5930,27 @@ static void tcp_input(struct wolfIP *S, unsigned int if_idx,
                             (void)wolfIP_filter_notify_socket_event(
                                 WOLFIP_FILT_CLOSE_WAIT, S, t,
                                 t->local_ip, t->src_port, t->remote_ip, t->dst_port);
+                            transitioned = 1;
                         } else if (t->sock.tcp.state == TCP_FIN_WAIT_1) {
                             t->sock.tcp.state = TCP_CLOSING;
+                            transitioned = 1;
                         } else if (t->sock.tcp.state == TCP_FIN_WAIT_2) {
                             tcp_fin_wait_2_timeout_stop(t);
                             t->sock.tcp.state = TCP_TIME_WAIT;
+                            transitioned = 1;
                         }
-                        if (tcplen > 0) {
-                            t->sock.tcp.ack = tcp_seq_inc(fin_seq_end, 1);
-                        } else {
-                            t->sock.tcp.ack = tcp_seq_inc(seq, 1);
+                        /* Only a state transition consumes the FIN's
+                         * sequence number: a FIN that re-arrives in
+                         * CLOSE_WAIT, CLOSING or TIME_WAIT is re-ACKed
+                         * without advancing the receive ACK. */
+                        if (transitioned) {
+                            if (tcplen > 0) {
+                                t->sock.tcp.ack = tcp_seq_inc(fin_seq_end, 1);
+                            } else {
+                                t->sock.tcp.ack = tcp_seq_inc(seq, 1);
+                            }
+                            t->events |= CB_EVENT_CLOSED | CB_EVENT_READABLE;
                         }
-                        t->events |= CB_EVENT_CLOSED | CB_EVENT_READABLE;
                         tcp_send_ack(t);
                     } else {
                         tcp_send_ack(t);
