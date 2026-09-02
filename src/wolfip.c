@@ -9826,6 +9826,21 @@ static void arp_recv(struct wolfIP *s, unsigned int if_idx, void *buf, int len)
     if (arp->sma[0] & 0x01)
         return;
 
+    /* RFC 4331/5227 DAD: on the probing interface, a request from a
+     * foreign MAC that claims the candidate (sender IP) or probes for it
+     * is a conflict - a host that owns the candidate may not answer our
+     * probe (DAD evasion), but betrays itself by using/probing the IP. */
+    if (arp->opcode == ee16(ARP_REQUEST) && s->dhcp_state == DHCP_DAD &&
+            if_idx == s->dhcp_dad_if && memcmp(arp->sma, ll->mac, 6) != 0) {
+        ip4 sip = ee32(arp->sip);
+        ip4 tip = ee32(arp->tip);
+        if ((sip == s->dhcp_ip && tip != s->dhcp_ip) ||
+                (sip == IPADDR_ANY && tip == s->dhcp_ip)) {
+            dhcp_dad_conflict(s);
+            return;
+        }
+    }
+
     /* An unconfigured interface (no assigned address) must not answer
      * ARP requests: matching tip against a zero conf->ip would let a
      * request for 0.0.0.0 be answered by advertising 0.0.0.0. */
