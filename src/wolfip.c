@@ -5903,12 +5903,10 @@ static void tcp_input(struct wolfIP *S, unsigned int if_idx,
                 if (!(tcp->flags & TCP_FLAG_ACK))
                     continue;
 
-                if (tcp->flags & TCP_FLAG_ACK) {
-                    tcp_ack(t, tcp);
-                    if (t->sock.tcp.state == TCP_CLOSED)
-                        continue;
-                    tcp_process_ts(t, tcp, frame_len);
-                }
+                tcp_ack(t, tcp);
+                if (t->sock.tcp.state == TCP_CLOSED)
+                    continue;
+                tcp_process_ts(t, tcp, frame_len);
                 if (tcplen > 0) {
                     if ((t->sock.tcp.state == TCP_LAST_ACK) || (t->sock.tcp.state == TCP_CLOSING) ||
                         (t->sock.tcp.state == TCP_CLOSED))
