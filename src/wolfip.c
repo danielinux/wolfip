@@ -9824,7 +9824,11 @@ static void arp_recv(struct wolfIP *s, unsigned int if_idx, void *buf, int len)
     if (arp->sma[0] & 0x01)
         return;
 
-    if (arp->opcode == ee16(ARP_REQUEST) && arp->tip == ee32(conf->ip)) {
+    /* An unconfigured interface (no assigned address) must not answer
+     * ARP requests: matching tip against a zero conf->ip would let a
+     * request for 0.0.0.0 be answered by advertising 0.0.0.0. */
+    if (arp->opcode == ee16(ARP_REQUEST) && conf->ip != IPADDR_ANY &&
+            arp->tip == ee32(conf->ip)) {
         uint32_t sender_ip = arp->sip;
         uint8_t sender_mac[6];
         memcpy(sender_mac, arp->sma, 6);

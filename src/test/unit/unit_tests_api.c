@@ -4776,6 +4776,71 @@ START_TEST(test_arp_recv_rejects_multicast_sender)
 }
 END_TEST
 
+/* An unconfigured interface (no assigned address) must not answer ARP
+ * requests: matching the target against a zero conf->ip let a request
+ * for 0.0.0.0 be answered by advertising 0.0.0.0 as the sender protocol
+ * address. */
+START_TEST(test_arp_recv_unconfigured_if_does_not_answer)
+{
+    struct wolfIP s;
+    struct arp_packet arp;
+    struct wolfIP_ll_dev *ll;
+    struct ipconf *conf;
+    static const uint8_t fake_mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x03};
+    uint32_t frames_before;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    mock_link_init_idx(&s, TEST_SECOND_IF, NULL);
+    wolfIP_ipconfig_set(&s, 0x0A000001U, 0xFFFFFF00U, 0);
+
+    conf = wolfIP_ipconf_at(&s, TEST_SECOND_IF);
+    ck_assert_uint_eq(conf->ip, IPADDR_ANY);
+
+    /* A request for 0.0.0.0 on the unconfigured secondary: no reply. */
+    ll = wolfIP_getdev_ex(&s, TEST_SECOND_IF);
+    memset(&arp, 0, sizeof(arp));
+    memcpy(arp.eth.dst, ll->mac, 6);
+    memcpy(arp.eth.src, fake_mac, 6);
+    arp.eth.type = ee16(ETH_TYPE_ARP);
+    arp.htype = ee16(1);
+    arp.ptype = ee16(0x0800);
+    arp.hlen = 6;
+    arp.plen = 4;
+    arp.opcode = ee16(ARP_REQUEST);
+    memcpy(arp.sma, fake_mac, 6);
+    arp.sip = ee32(0x0A000002U);
+    memset(arp.tma, 0, 6);
+    arp.tip = ee32(IPADDR_ANY);
+
+    frames_before = last_frame_sent_count;
+    arp_recv(&s, TEST_SECOND_IF, &arp, sizeof(arp));
+    ck_assert_uint_eq(last_frame_sent_count, frames_before);
+
+    /* Control: a request for the primary's IP on the configured primary
+     * is still answered. */
+    ll = wolfIP_getdev_ex(&s, TEST_PRIMARY_IF);
+    conf = wolfIP_ipconf_at(&s, TEST_PRIMARY_IF);
+    memset(&arp, 0, sizeof(arp));
+    memcpy(arp.eth.dst, ll->mac, 6);
+    memcpy(arp.eth.src, fake_mac, 6);
+    arp.eth.type = ee16(ETH_TYPE_ARP);
+    arp.htype = ee16(1);
+    arp.ptype = ee16(0x0800);
+    arp.hlen = 6;
+    arp.plen = 4;
+    arp.opcode = ee16(ARP_REQUEST);
+    memcpy(arp.sma, fake_mac, 6);
+    arp.sip = ee32(0x0A000002U);
+    memset(arp.tma, 0, 6);
+    arp.tip = ee32(conf->ip);
+
+    frames_before = last_frame_sent_count;
+    arp_recv(&s, TEST_PRIMARY_IF, &arp, sizeof(arp));
+    ck_assert_uint_eq(last_frame_sent_count, frames_before + 1);
+}
+END_TEST
+
 /* Regression: arp_recv must reject ARP packets with incorrect hardware or
  * protocol type fields (htype != 1, ptype != 0x0800, hlen != 6, plen != 4).
  * Without validation, non-Ethernet/IPv4 ARP packets pollute the cache. */

@@ -280,6 +280,7 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_utils, test_ip_recv_drops_zero_source);
     tcase_add_test(tc_utils, test_arp_recv_rejects_broadcast_sender);
     tcase_add_test(tc_utils, test_arp_recv_rejects_multicast_sender);
+    tcase_add_test(tc_utils, test_arp_recv_unconfigured_if_does_not_answer);
     tcase_add_test(tc_utils, test_dhcp_ack_rejects_mismatched_server_id);
     tcase_add_test(tc_utils, test_udp_no_icmp_unreachable_for_broadcast_src);
     tcase_add_test(tc_utils, test_udp_no_icmp_unreachable_for_multicast_src);
