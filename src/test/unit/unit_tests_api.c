@@ -1555,6 +1555,47 @@ START_TEST(test_udp_auto_port_skips_in_use)
 }
 END_TEST
 
+/* The allocator walks the whole min_port..65535 range: a collision run
+ * longer than the old 16-try limit must be skipped, not returned. With the
+ * RNG pinned to the run start, the old loop stopped after 16 tries and
+ * returned an in-use port. */
+START_TEST(test_port_alloc_walks_past_long_collision_run)
+{
+    static struct tsocket arr[18];
+    uint16_t port;
+    int i;
+
+    memset(arr, 0, sizeof(arr));
+    /* 17 consecutive ports in use, starting at the pinned RNG start. */
+    for (i = 0; i < 17; i++)
+        arr[i].src_port = (uint16_t)(1024 + i);
+    test_rand_override_enabled = 1;
+    test_rand_override_value = 1024U;
+    port = port_alloc_random(arr, 18, &arr[17], IPADDR_ANY, 1024);
+    test_rand_override_enabled = 0;
+    ck_assert_uint_eq(port, 1041U);
+    ck_assert_int_eq(bind_port_in_use(arr, 18, &arr[17], IPADDR_ANY, port), 0);
+}
+END_TEST
+
+/* When the candidate range holds no free port the allocator returns 0
+ * instead of a collided value: callers treat 0 as allocation failure. */
+START_TEST(test_port_alloc_returns_zero_when_range_exhausted)
+{
+    static struct tsocket arr[2];
+    uint16_t port;
+
+    memset(arr, 0, sizeof(arr));
+    /* The only candidate (min_port == 65535) is already claimed. */
+    arr[0].src_port = 65535;
+    test_rand_override_enabled = 1;
+    test_rand_override_value = 65535U;
+    port = port_alloc_random(arr, 2, &arr[1], IPADDR_ANY, 65535);
+    test_rand_override_enabled = 0;
+    ck_assert_uint_eq(port, 0U);
+}
+END_TEST
+
 START_TEST(test_sock_bind_udp_filter_blocks)
 {
     struct wolfIP s;
