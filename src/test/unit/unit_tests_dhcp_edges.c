@@ -1797,6 +1797,60 @@ START_TEST(test_dhcp_dad_probe_for_candidate_conflict)
 }
 END_TEST
 
+/* During DAD, a foreign host announcing the candidate with a gratuitous
+ * ARP request (sip==tip==candidate) is a conflict: it is using the address,
+ * which is exactly what DAD must rule out. */
+START_TEST(test_dhcp_dad_garp_announcement_conflict)
+{
+    struct wolfIP s;
+    struct dhcp_msg msg;
+    struct arp_packet req;
+    struct wolfIP_ll_dev *ll;
+    struct ipconf *primary;
+    uint32_t server_ip = 0x0A000001U;
+    uint32_t client_ip = 0x0A000064U;
+    uint8_t other_mac[6] = {0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0x06};
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    s.dhcp_xid = 0xDA09U;
+    s.dhcp_state = DHCP_REQUEST_SENT;
+    s.last_tick = 1000U;
+    primary = wolfIP_primary_ipconf(&s);
+    ck_assert_ptr_nonnull(primary);
+    primary->ip = client_ip;
+
+    build_full_ack(&s, &msg, server_ip, client_ip, 0xFFFFFF00U,
+                   server_ip, 0x08080808U, 120U);
+    ck_assert_int_eq(dhcp_parse_ack(&s, &msg, sizeof(msg)), 0);
+    ck_assert_int_eq(s.dhcp_state, DHCP_DAD);
+
+    /* A foreign host announcing the candidate (gratuitous ARP: the request
+     * carries sip==tip==candidate): conflict. */
+    ll = wolfIP_getdev_ex(&s, TEST_PRIMARY_IF);
+    ck_assert_ptr_nonnull(ll);
+    memset(&req, 0, sizeof(req));
+    memcpy(req.eth.dst, ll->mac, 6);
+    memcpy(req.eth.src, other_mac, 6);
+    req.eth.type = ee16(ETH_TYPE_ARP);
+    req.htype = ee16(1);
+    req.ptype = ee16(0x0800);
+    req.hlen = 6;
+    req.plen = 4;
+    req.opcode = ee16(ARP_REQUEST);
+    memcpy(req.sma, other_mac, 6);
+    req.sip = ee32(client_ip);
+    req.tip = ee32(client_ip);
+
+    arp_recv(&s, TEST_PRIMARY_IF, &req, sizeof(req));
+
+    /* Conflict detected: DAD aborted, lease released, back to DISCOVER. */
+    ck_assert_int_eq(s.dhcp_state, DHCP_DISCOVER_SENT);
+    ck_assert_uint_eq(s.dhcp_dad_probes, 0U);
+    ck_assert_uint_eq(primary->ip, 0U);
+}
+END_TEST
+
 /* A reply with our own MAC is our own probe looping back: ignored, DAD
  * continues. */
 START_TEST(test_dhcp_dad_own_mac_reply_ignored)
