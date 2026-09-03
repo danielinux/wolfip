@@ -5766,3 +5766,190 @@ START_TEST(test_tcp_listener_revert_restores_option_baseline)
     ck_assert_uint_eq(lsn->sock.tcp.ts_offer, fresh->sock.tcp.ts_offer);
 }
 END_TEST
+
+/* A handshake that completes before accept() leaves the listener
+ * ESTABLISHED with the pre-accept fast-fail timer armed. If the
+ * application closes the socket instead of accepting, the control RTO
+ * takes over the shared timer slot and must keep retransmitting the
+ * FIN-ACK on every expiry. The pre-accept flag has to go with the timer
+ * it armed: left behind, tcp_rto_cb's pre-accept branch sees a socket
+ * that left the pinned condition, disarms quietly, and the FIN_WAIT_1
+ * close stalls with no retransmit and no retry budget. */
+START_TEST(test_tcp_listener_preaccept_close_rto_retransmits_finack)
+{
+    struct wolfIP s;
+    int fd;
+    struct tsocket *lsn;
+    uint64_t t;
+    uint32_t frames_before;
+    const struct wolfIP_tcp_seg *out;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    wolfIP_ipconfig_set(&s, LLK_LOCAL_IP, LLK_NET_MASK, 0);
+    fd = llk_open_listener(&s);
+    lsn = &s.tcpsockets[SOCKET_UNMARK(fd)];
+
+    /* Pending-only ARP policy: the peer is a known neighbor, so the
+     * FIN-ACK retransmits reach the wire. */
+    llk_keep_arp_fresh(&s, LLK_ATT_IP);
+
+    llk_attacker_syn(&s, LLK_ATT_IP, 41000, 1, 0);
+    llk_complete_handshake(&s, lsn, LLK_ATT_IP, 41000, 1);
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_ESTABLISHED);
+    ck_assert_int_eq(lsn->sock.tcp.preaccept_timeout_active, 1);
+
+    /* Close the established-but-unaccepted connection: FIN_WAIT_1, the
+     * control RTO owns the timer slot, and the pre-accept flag must be
+     * gone with the timer it armed. */
+    ck_assert_int_eq(wolfIP_sock_close(&s, fd), -WOLFIP_EAGAIN);
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_FIN_WAIT_1);
+    ck_assert_int_eq(lsn->sock.tcp.preaccept_timeout_active, 0);
+    ck_assert_int_eq(lsn->sock.tcp.ctrl_rto_active, 1);
+    ck_assert_uint_ne(lsn->sock.tcp.tmr_rto, NO_TIMER);
+
+    /* First poll drains the queued FIN-ACK. */
+    (void)wolfIP_poll(&s, 3);
+    out = llk_last_tcp();
+    ck_assert_ptr_nonnull(out);
+    ck_assert(out->flags & (TCP_FLAG_FIN | TCP_FLAG_ACK));
+
+    /* The control RTO fires: the FIN-ACK is retransmitted and the
+     * backoff re-armed, not silently disarmed. */
+    frames_before = last_frame_sent_count;
+    for (t = 4; t <= 2500; t += 100) {
+        (void)wolfIP_poll(&s, t);
+    }
+    ck_assert_uint_eq(last_frame_sent_count, frames_before + 1);
+    out = llk_last_tcp();
+    ck_assert_ptr_nonnull(out);
+    ck_assert(out->flags & (TCP_FLAG_FIN | TCP_FLAG_ACK));
+    ck_assert_uint_eq(ee16(out->src_port), LLK_LISTEN_PORT);
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_FIN_WAIT_1);
+    ck_assert_int_eq(lsn->sock.tcp.ctrl_rto_active, 1);
+    ck_assert_uint_ne(lsn->sock.tcp.tmr_rto, NO_TIMER);
+}
+END_TEST
+
+/* An acceptable FIN that arrives in CLOSE_WAIT or CLOSING does not move
+ * the state machine: the peer's FIN was already consumed on the way in.
+ * It must not advance the receive ACK either, or a peer that keeps
+ * sending FINs at RCV.NXT would march the ACK forward with no state
+ * change. */
+START_TEST(test_tcp_fin_in_close_wait_does_not_advance_ack)
+{
+    struct wolfIP s;
+    int fd;
+    struct tsocket *lsn;
+    uint8_t seg_buf[sizeof(struct wolfIP_tcp_seg)];
+    struct wolfIP_tcp_seg *fin = (struct wolfIP_tcp_seg *)seg_buf;
+    uint32_t rcv_nxt;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    wolfIP_ipconfig_set(&s, LLK_LOCAL_IP, LLK_NET_MASK, 0);
+    fd = llk_open_listener(&s);
+    lsn = &s.tcpsockets[SOCKET_UNMARK(fd)];
+
+    llk_keep_arp_fresh(&s, LLK_ATT_IP);
+
+    llk_attacker_syn(&s, LLK_ATT_IP, 41000, 1, 0);
+    llk_complete_handshake(&s, lsn, LLK_ATT_IP, 41000, 1);
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_ESTABLISHED);
+    rcv_nxt = lsn->sock.tcp.ack;
+
+    /* The peer's FIN at RCV.NXT: ESTABLISHED -> CLOSE_WAIT, ACK advances. */
+    memset(seg_buf, 0, sizeof(seg_buf));
+    fin->ip.ver_ihl = 0x45;
+    fin->ip.proto = WI_IPPROTO_TCP;
+    fin->ip.ttl = 64;
+    fin->ip.len = ee16(IP_HEADER_LEN + TCP_HEADER_LEN);
+    fin->ip.src = ee32(lsn->remote_ip);
+    fin->ip.dst = ee32(lsn->local_ip);
+    fin->dst_port = ee16(lsn->src_port);
+    fin->src_port = ee16(lsn->dst_port);
+    fin->seq = ee32(rcv_nxt);
+    fin->ack = ee32(tcp_seq_inc(lsn->sock.tcp.snd_una, 1));
+    fin->hlen = TCP_HEADER_LEN << 2;
+    fin->flags = TCP_FLAG_FIN | TCP_FLAG_ACK;
+    fix_tcp_checksums(fin);
+    tcp_input(&s, TEST_PRIMARY_IF, fin,
+              (uint32_t)(ETH_HEADER_LEN + IP_HEADER_LEN + TCP_HEADER_LEN));
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_CLOSE_WAIT);
+    ck_assert_uint_eq(lsn->sock.tcp.ack, rcv_nxt + 1);
+
+    /* A second FIN at the new RCV.NXT: no state change in CLOSE_WAIT,
+     * and the receive ACK must not advance. */
+    fin->seq = ee32(rcv_nxt + 1);
+    fix_tcp_checksums(fin);
+    tcp_input(&s, TEST_PRIMARY_IF, fin,
+              (uint32_t)(ETH_HEADER_LEN + IP_HEADER_LEN + TCP_HEADER_LEN));
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_CLOSE_WAIT);
+    ck_assert_uint_eq(lsn->sock.tcp.ack, rcv_nxt + 1);
+}
+END_TEST
+
+/* When the timer heap is full, tcp_ctrl_rto_start must not mark the
+ * control RTO active: an active flag with no timer behind it would never
+ * fire and would suppress every other timeout. */
+START_TEST(test_tcp_ctrl_rto_start_no_timer_does_not_set_active)
+{
+    struct wolfIP s;
+    struct tsocket *ts;
+    struct wolfIP_timer t = {0};
+    int i;
+
+    wolfIP_init(&s);
+    t.cb = tcp_rto_cb;
+    for (i = 0; i < MAX_TIMERS; i++) {
+        t.arg = (void *)(intptr_t)i;
+        t.expires = s.last_tick + 1000 + i;
+        timers_binheap_insert(&s.timers, t);
+    }
+    ts = &s.tcpsockets[0];
+    ts->S = &s;
+    ts->proto = WI_IPPROTO_TCP;
+    ts->sock.tcp.rto = 1000;
+    ts->sock.tcp.ctrl_rto_retries = 0;
+    ts->sock.tcp.tmr_rto = NO_TIMER;
+    ts->sock.tcp.ctrl_rto_active = 0;
+    tcp_ctrl_rto_start(ts, s.last_tick);
+    /* Heap full: insert failed, so the control RTO must not be active. */
+    ck_assert_int_eq(ts->sock.tcp.tmr_rto, NO_TIMER);
+    ck_assert_int_eq(ts->sock.tcp.ctrl_rto_active, 0);
+}
+END_TEST
+
+/* A re-arm (the normal retransmit path) enters with ctrl_rto_active set by
+ * the prior arm: if the re-insert into a full heap fails, the flag must not
+ * survive - an active flag with no timer behind it wedges the socket the
+ * same way a failed first arm does. */
+START_TEST(test_tcp_ctrl_rto_start_rearm_failure_clears_active)
+{
+    struct wolfIP s;
+    struct tsocket *ts;
+    struct wolfIP_timer t = {0};
+    int i;
+
+    wolfIP_init(&s);
+    t.cb = tcp_rto_cb;
+    for (i = 0; i < MAX_TIMERS; i++) {
+        t.arg = (void *)(intptr_t)i;
+        t.expires = s.last_tick + 1000 + i;
+        timers_binheap_insert(&s.timers, t);
+    }
+    ts = &s.tcpsockets[0];
+    ts->S = &s;
+    ts->proto = WI_IPPROTO_TCP;
+    ts->sock.tcp.rto = 1000;
+    ts->sock.tcp.ctrl_rto_retries = 0;
+    ts->sock.tcp.tmr_rto = NO_TIMER;
+    /* State at the start of a retransmit: the prior arm succeeded and its
+     * timer has since fired, so the flag is set and the slot is empty. */
+    ts->sock.tcp.ctrl_rto_active = 1;
+    tcp_ctrl_rto_start(ts, s.last_tick);
+    /* Heap full: the re-insert failed, so the flag must be cleared. */
+    ck_assert_int_eq(ts->sock.tcp.tmr_rto, NO_TIMER);
+    ck_assert_int_eq(ts->sock.tcp.ctrl_rto_active, 0);
+}
+END_TEST

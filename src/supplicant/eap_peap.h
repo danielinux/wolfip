@@ -63,9 +63,9 @@ int eap_peap_build_mschapv2_response(uint8_t *out, size_t out_cap,
                                      size_t      username_len,
                                      size_t *out_len);
 
-/* Build the trivial inner EAP-Response/MSCHAPv2 Success ack: 6 bytes,
- *   [Code=Resp, id, length=6 BE, type=26, opcode=Success]
- * sent in reply to the server's "S=..." Success Request.
+/* Build the 2-byte compressed inner MSCHAPv2 Success acknowledgment:
+ * [type=26, opcode=Success], sent in reply to the server's Success
+ * Request. eap_id is unused because PEAPv0 omits the inner EAP header.
  */
 int eap_peap_build_mschapv2_ack(uint8_t *out, size_t out_cap,
                                 uint8_t  eap_id,

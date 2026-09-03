@@ -1689,6 +1689,168 @@ START_TEST(test_dhcp_dad_conflict_releases_and_rediscover)
 }
 END_TEST
 
+/* During DAD, a foreign host that uses the candidate as its sender IP (an
+ * ARP request, not a reply) must be detected as a conflict: a host that
+ * owns the candidate can evade DAD by not answering our probe, but betrays
+ * itself by using the address. */
+START_TEST(test_dhcp_dad_request_claiming_candidate_conflict)
+{
+    struct wolfIP s;
+    struct dhcp_msg msg;
+    struct arp_packet req;
+    struct wolfIP_ll_dev *ll;
+    struct ipconf *primary;
+    uint32_t server_ip = 0x0A000001U;
+    uint32_t client_ip = 0x0A000064U;
+    uint8_t other_mac[6] = {0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0x04};
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    s.dhcp_xid = 0xDA07U;
+    s.dhcp_state = DHCP_REQUEST_SENT;
+    s.last_tick = 1000U;
+    primary = wolfIP_primary_ipconf(&s);
+    ck_assert_ptr_nonnull(primary);
+    primary->ip = client_ip;
+
+    build_full_ack(&s, &msg, server_ip, client_ip, 0xFFFFFF00U,
+                   server_ip, 0x08080808U, 120U);
+    ck_assert_int_eq(dhcp_parse_ack(&s, &msg, sizeof(msg)), 0);
+    ck_assert_int_eq(s.dhcp_state, DHCP_DAD);
+
+    /* A foreign host using the candidate as its sender IP (request, not
+     * reply): the DAD must treat it as a conflict, not answer it. */
+    ll = wolfIP_getdev_ex(&s, TEST_PRIMARY_IF);
+    ck_assert_ptr_nonnull(ll);
+    memset(&req, 0, sizeof(req));
+    memcpy(req.eth.dst, ll->mac, 6);
+    memcpy(req.eth.src, other_mac, 6);
+    req.eth.type = ee16(ETH_TYPE_ARP);
+    req.htype = ee16(1);
+    req.ptype = ee16(0x0800);
+    req.hlen = 6;
+    req.plen = 4;
+    req.opcode = ee16(ARP_REQUEST);
+    memcpy(req.sma, other_mac, 6);
+    req.sip = ee32(client_ip);
+    req.tip = ee32(0x0A000002U);
+
+    arp_recv(&s, TEST_PRIMARY_IF, &req, sizeof(req));
+
+    /* Conflict detected: DAD aborted, lease released, back to DISCOVER. */
+    ck_assert_int_eq(s.dhcp_state, DHCP_DISCOVER_SENT);
+    ck_assert_uint_eq(s.dhcp_dad_probes, 0U);
+    ck_assert_uint_eq(primary->ip, 0U);
+}
+END_TEST
+
+/* During DAD, a foreign host probing for the candidate (its own DAD: an ARP
+ * request with sip = 0.0.0.0, tip = candidate) is a conflict: two hosts
+ * cannot bind the same address. Our own probe is excluded by the MAC check. */
+START_TEST(test_dhcp_dad_probe_for_candidate_conflict)
+{
+    struct wolfIP s;
+    struct dhcp_msg msg;
+    struct arp_packet req;
+    struct wolfIP_ll_dev *ll;
+    struct ipconf *primary;
+    uint32_t server_ip = 0x0A000001U;
+    uint32_t client_ip = 0x0A000064U;
+    uint8_t other_mac[6] = {0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0x05};
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    s.dhcp_xid = 0xDA08U;
+    s.dhcp_state = DHCP_REQUEST_SENT;
+    s.last_tick = 1000U;
+    primary = wolfIP_primary_ipconf(&s);
+    ck_assert_ptr_nonnull(primary);
+    primary->ip = client_ip;
+
+    build_full_ack(&s, &msg, server_ip, client_ip, 0xFFFFFF00U,
+                   server_ip, 0x08080808U, 120U);
+    ck_assert_int_eq(dhcp_parse_ack(&s, &msg, sizeof(msg)), 0);
+    ck_assert_int_eq(s.dhcp_state, DHCP_DAD);
+
+    /* A foreign host probing for the candidate (its own DAD): conflict. */
+    ll = wolfIP_getdev_ex(&s, TEST_PRIMARY_IF);
+    ck_assert_ptr_nonnull(ll);
+    memset(&req, 0, sizeof(req));
+    memcpy(req.eth.dst, ll->mac, 6);
+    memcpy(req.eth.src, other_mac, 6);
+    req.eth.type = ee16(ETH_TYPE_ARP);
+    req.htype = ee16(1);
+    req.ptype = ee16(0x0800);
+    req.hlen = 6;
+    req.plen = 4;
+    req.opcode = ee16(ARP_REQUEST);
+    memcpy(req.sma, other_mac, 6);
+    req.sip = ee32(IPADDR_ANY);
+    req.tip = ee32(client_ip);
+
+    arp_recv(&s, TEST_PRIMARY_IF, &req, sizeof(req));
+
+    /* Conflict detected: DAD aborted, lease released, back to DISCOVER. */
+    ck_assert_int_eq(s.dhcp_state, DHCP_DISCOVER_SENT);
+    ck_assert_uint_eq(s.dhcp_dad_probes, 0U);
+    ck_assert_uint_eq(primary->ip, 0U);
+}
+END_TEST
+
+/* During DAD, a foreign host announcing the candidate with a gratuitous
+ * ARP request (sip==tip==candidate) is a conflict: it is using the address,
+ * which is exactly what DAD must rule out. */
+START_TEST(test_dhcp_dad_garp_announcement_conflict)
+{
+    struct wolfIP s;
+    struct dhcp_msg msg;
+    struct arp_packet req;
+    struct wolfIP_ll_dev *ll;
+    struct ipconf *primary;
+    uint32_t server_ip = 0x0A000001U;
+    uint32_t client_ip = 0x0A000064U;
+    uint8_t other_mac[6] = {0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0x06};
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    s.dhcp_xid = 0xDA09U;
+    s.dhcp_state = DHCP_REQUEST_SENT;
+    s.last_tick = 1000U;
+    primary = wolfIP_primary_ipconf(&s);
+    ck_assert_ptr_nonnull(primary);
+    primary->ip = client_ip;
+
+    build_full_ack(&s, &msg, server_ip, client_ip, 0xFFFFFF00U,
+                   server_ip, 0x08080808U, 120U);
+    ck_assert_int_eq(dhcp_parse_ack(&s, &msg, sizeof(msg)), 0);
+    ck_assert_int_eq(s.dhcp_state, DHCP_DAD);
+
+    /* A foreign host announcing the candidate (gratuitous ARP: the request
+     * carries sip==tip==candidate): conflict. */
+    ll = wolfIP_getdev_ex(&s, TEST_PRIMARY_IF);
+    ck_assert_ptr_nonnull(ll);
+    memset(&req, 0, sizeof(req));
+    memcpy(req.eth.dst, ll->mac, 6);
+    memcpy(req.eth.src, other_mac, 6);
+    req.eth.type = ee16(ETH_TYPE_ARP);
+    req.htype = ee16(1);
+    req.ptype = ee16(0x0800);
+    req.hlen = 6;
+    req.plen = 4;
+    req.opcode = ee16(ARP_REQUEST);
+    memcpy(req.sma, other_mac, 6);
+    req.sip = ee32(client_ip);
+    req.tip = ee32(client_ip);
+
+    arp_recv(&s, TEST_PRIMARY_IF, &req, sizeof(req));
+
+    /* Conflict detected: DAD aborted, lease released, back to DISCOVER. */
+    ck_assert_int_eq(s.dhcp_state, DHCP_DISCOVER_SENT);
+    ck_assert_uint_eq(s.dhcp_dad_probes, 0U);
+    ck_assert_uint_eq(primary->ip, 0U);
+}
+END_TEST
+
 /* A reply with our own MAC is our own probe looping back: ignored, DAD
  * continues. */
 START_TEST(test_dhcp_dad_own_mac_reply_ignored)
@@ -1820,6 +1982,64 @@ START_TEST(test_dhcp_dad_reply_for_other_ip_ignored)
 
     ck_assert_int_eq(s.dhcp_state, DHCP_DAD);
     ck_assert_uint_eq(s.dhcp_dad_probes, 1U);
+}
+END_TEST
+
+/* During DAD, a spoofed reply (sip = 0.0.0.0) arriving on an unconfigured
+ * secondary interface must not force a conflict on the primary lease: the
+ * DAD hook is bound to the probing interface and the recorded candidate,
+ * not the receiving interface's (zero) address. */
+START_TEST(test_dhcp_dad_reply_on_unconfigured_secondary_ignored)
+{
+    struct wolfIP s;
+    struct dhcp_msg msg;
+    struct arp_packet reply;
+    struct wolfIP_ll_dev *ll;
+    struct ipconf *primary;
+    uint32_t server_ip = 0x0A000001U;
+    uint32_t client_ip = 0x0A000064U;
+    uint8_t other_mac[6] = {0x02, 0xAA, 0xBB, 0xCC, 0xDD, 0x03};
+
+    /* Primary holds the candidate; the secondary is left unconfigured so
+     * its conf->ip is IPADDR_ANY (the trap the old check fell into). */
+    setup_stack_with_two_ifaces(&s, client_ip, 0x0A010001U);
+    wolfIP_ipconf_at(&s, TEST_SECOND_IF)->ip = IPADDR_ANY;
+    s.dhcp_xid = 0xDA06U;
+    s.dhcp_state = DHCP_REQUEST_SENT;
+    s.last_tick = 1000U;
+    primary = wolfIP_primary_ipconf(&s);
+    ck_assert_ptr_nonnull(primary);
+    primary->ip = client_ip;
+
+    build_full_ack(&s, &msg, server_ip, client_ip, 0xFFFFFF00U,
+                   server_ip, 0x08080808U, 120U);
+    ck_assert_int_eq(dhcp_parse_ack(&s, &msg, sizeof(msg)), 0);
+    ck_assert_int_eq(s.dhcp_state, DHCP_DAD);
+
+    /* A spoofed reply with a zero sender IP on the unconfigured secondary:
+     * the old check (sip == conf->ip) saw 0 == 0 and forced a conflict on
+     * the primary lease. The DAD hook must stay on the probing interface. */
+    ll = wolfIP_getdev_ex(&s, TEST_SECOND_IF);
+    ck_assert_ptr_nonnull(ll);
+    memset(&reply, 0, sizeof(reply));
+    memcpy(reply.eth.dst, ll->mac, 6);
+    memcpy(reply.eth.src, other_mac, 6);
+    reply.eth.type = ee16(ETH_TYPE_ARP);
+    reply.htype = ee16(1);
+    reply.ptype = ee16(0x0800);
+    reply.hlen = 6;
+    reply.plen = 4;
+    reply.opcode = ee16(ARP_REPLY);
+    memcpy(reply.sma, other_mac, 6);
+    reply.sip = ee32(IPADDR_ANY);
+    reply.tip = ee32(client_ip);
+
+    arp_recv(&s, TEST_SECOND_IF, &reply, sizeof(reply));
+
+    /* No conflict: DAD continues, the primary lease is intact. */
+    ck_assert_int_eq(s.dhcp_state, DHCP_DAD);
+    ck_assert_uint_eq(s.dhcp_dad_probes, 1U);
+    ck_assert_uint_eq(primary->ip, client_ip);
 }
 END_TEST
 

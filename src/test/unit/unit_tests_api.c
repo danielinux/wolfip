@@ -406,6 +406,53 @@ START_TEST(test_filter_notify_udp_ihl_truncated_no_overread)
 }
 END_TEST
 
+START_TEST(test_filter_notify_raw_tx_eth_header_built)
+{
+    struct wolfIP s;
+    struct wolfIP_sockaddr_in dst;
+    uint8_t payload[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+    uint8_t bcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    int raw_sd;
+    int ret;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    wolfIP_ipconfig_set(&s, 0x0A000001U, 0xFFFFFF00U, 0);
+
+    filter_cb_calls = 0;
+    memset(&filter_last_event, 0, sizeof(filter_last_event));
+    wolfIP_filter_set_callback(test_filter_cb, NULL);
+    wolfIP_filter_set_mask(WOLFIP_FILT_MASK(WOLFIP_FILT_SENDING));
+
+    raw_sd = wolfIP_sock_socket(&s, AF_INET, IPSTACK_SOCK_RAW, WI_IPPROTO_UDP);
+    ck_assert_int_ge(raw_sd, 0);
+
+    /* Limited broadcast: the nexthop MAC is all-ones, so the flush
+     * path needs no ARP entry. */
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = ee32(0xFFFFFFFFU);
+
+    ret = wolfIP_sock_sendto(&s, raw_sd, payload, sizeof(payload), 0,
+            (struct wolfIP_sockaddr *)&dst, sizeof(dst));
+    ck_assert_int_eq(ret, (int)sizeof(payload));
+
+    (void)wolfIP_poll(&s, 0);
+
+    wolfIP_filter_set_callback(NULL, NULL);
+    wolfIP_sock_close(&s, raw_sd);
+
+    /* The eth event must carry the header the frame was actually sent
+     * with: all-ones destination, the interface MAC as source. */
+    ck_assert_int_ge(filter_cb_calls, 1);
+    ck_assert_uint_eq(filter_last_event.meta.ip_proto,
+                      WOLFIP_FILTER_PROTO_ETH);
+    ck_assert_int_eq(memcmp(filter_last_event.meta.dst_mac, bcast_mac, 6), 0);
+    ck_assert_int_eq(memcmp(filter_last_event.meta.src_mac,
+            wolfIP_ll_at(&s, TEST_PRIMARY_IF)->mac, 6), 0);
+}
+END_TEST
+
 
 START_TEST(test_filter_dispatch_no_callback)
 {
@@ -1457,6 +1504,95 @@ START_TEST(test_sock_bind_udp_src_port_nonzero)
     sin.sin_addr.s_addr = ee32(0x0A000001U);
 
     ck_assert_int_eq(wolfIP_sock_bind(&s, udp_sd, (struct wolfIP_sockaddr *)&sin, sizeof(sin)), -1);
+}
+END_TEST
+
+/* An auto-assigned UDP source port must not collide with a port already
+ * bound by another socket: the allocator must skip in-use ports. With the
+ * RNG pinned to 5000 (the bound port), the fix walks forward to 5001. */
+START_TEST(test_udp_auto_port_skips_in_use)
+{
+    struct wolfIP s;
+    int udp_sd1, udp_sd2;
+    struct tsocket *ts2;
+    struct wolfIP_sockaddr_in sin;
+    const char payload[] = "test";
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    wolfIP_ipconfig_set(&s, 0x0A000001U, 0xFFFFFF00U, 0);
+
+    /* Bind the first UDP socket to port 5000. */
+    udp_sd1 = wolfIP_sock_socket(&s, AF_INET, IPSTACK_SOCK_DGRAM, WI_IPPROTO_UDP);
+    ck_assert_int_gt(udp_sd1, 0);
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = ee16(5000);
+    sin.sin_addr.s_addr = ee32(0x0A000001U);
+    ck_assert_int_eq(wolfIP_sock_bind(&s, udp_sd1,
+                    (struct wolfIP_sockaddr *)&sin, sizeof(sin)), 0);
+
+    /* Pin the RNG to 5000 (the bound port); the auto allocator must walk
+     * forward to 5001 instead of colliding. */
+    test_rand_override_enabled = 1;
+    test_rand_override_value = 5000U;
+
+    /* Create a second UDP socket and sendto (auto-assigns a source port). */
+    udp_sd2 = wolfIP_sock_socket(&s, AF_INET, IPSTACK_SOCK_DGRAM, WI_IPPROTO_UDP);
+    ck_assert_int_gt(udp_sd2, 0);
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = ee16(9999);
+    sin.sin_addr.s_addr = ee32(0x0A000002U);
+    ck_assert_int_ge(wolfIP_sock_sendto(&s, udp_sd2, payload, sizeof(payload), 0,
+                                        (const struct wolfIP_sockaddr *)&sin,
+                                        sizeof(sin)), 0);
+    test_rand_override_enabled = 0;
+
+    /* The auto port must be 5001 (not the bound 5000). */
+    ts2 = &s.udpsockets[SOCKET_UNMARK(udp_sd2)];
+    ck_assert_uint_eq(ts2->src_port, 5001U);
+}
+END_TEST
+
+/* The allocator walks the whole min_port..65535 range: a collision run
+ * longer than the old 16-try limit must be skipped, not returned. With the
+ * RNG pinned to the run start, the old loop stopped after 16 tries and
+ * returned an in-use port. */
+START_TEST(test_port_alloc_walks_past_long_collision_run)
+{
+    static struct tsocket arr[18];
+    uint16_t port;
+    int i;
+
+    memset(arr, 0, sizeof(arr));
+    /* 17 consecutive ports in use, starting at the pinned RNG start. */
+    for (i = 0; i < 17; i++)
+        arr[i].src_port = (uint16_t)(1024 + i);
+    test_rand_override_enabled = 1;
+    test_rand_override_value = 1024U;
+    port = port_alloc_random(arr, 18, &arr[17], IPADDR_ANY, 1024);
+    test_rand_override_enabled = 0;
+    ck_assert_uint_eq(port, 1041U);
+    ck_assert_int_eq(bind_port_in_use(arr, 18, &arr[17], IPADDR_ANY, port), 0);
+}
+END_TEST
+
+/* When the candidate range holds no free port the allocator returns 0
+ * instead of a collided value: callers treat 0 as allocation failure. */
+START_TEST(test_port_alloc_returns_zero_when_range_exhausted)
+{
+    static struct tsocket arr[2];
+    uint16_t port;
+
+    memset(arr, 0, sizeof(arr));
+    /* The only candidate (min_port == 65535) is already claimed. */
+    arr[0].src_port = 65535;
+    test_rand_override_enabled = 1;
+    test_rand_override_value = 65535U;
+    port = port_alloc_random(arr, 2, &arr[1], IPADDR_ANY, 65535);
+    test_rand_override_enabled = 0;
+    ck_assert_uint_eq(port, 0U);
 }
 END_TEST
 
@@ -4726,6 +4862,71 @@ START_TEST(test_arp_recv_rejects_multicast_sender)
     arp_recv(&s, TEST_PRIMARY_IF, &arp, sizeof(arp));
 
     ck_assert_int_lt(arp_neighbor_index(&s, TEST_PRIMARY_IF, 0xE0000001U), 0);
+}
+END_TEST
+
+/* An unconfigured interface (no assigned address) must not answer ARP
+ * requests: matching the target against a zero conf->ip let a request
+ * for 0.0.0.0 be answered by advertising 0.0.0.0 as the sender protocol
+ * address. */
+START_TEST(test_arp_recv_unconfigured_if_does_not_answer)
+{
+    struct wolfIP s;
+    struct arp_packet arp;
+    struct wolfIP_ll_dev *ll;
+    struct ipconf *conf;
+    static const uint8_t fake_mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x03};
+    uint32_t frames_before;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    mock_link_init_idx(&s, TEST_SECOND_IF, NULL);
+    wolfIP_ipconfig_set(&s, 0x0A000001U, 0xFFFFFF00U, 0);
+
+    conf = wolfIP_ipconf_at(&s, TEST_SECOND_IF);
+    ck_assert_uint_eq(conf->ip, IPADDR_ANY);
+
+    /* A request for 0.0.0.0 on the unconfigured secondary: no reply. */
+    ll = wolfIP_getdev_ex(&s, TEST_SECOND_IF);
+    memset(&arp, 0, sizeof(arp));
+    memcpy(arp.eth.dst, ll->mac, 6);
+    memcpy(arp.eth.src, fake_mac, 6);
+    arp.eth.type = ee16(ETH_TYPE_ARP);
+    arp.htype = ee16(1);
+    arp.ptype = ee16(0x0800);
+    arp.hlen = 6;
+    arp.plen = 4;
+    arp.opcode = ee16(ARP_REQUEST);
+    memcpy(arp.sma, fake_mac, 6);
+    arp.sip = ee32(0x0A000002U);
+    memset(arp.tma, 0, 6);
+    arp.tip = ee32(IPADDR_ANY);
+
+    frames_before = last_frame_sent_count;
+    arp_recv(&s, TEST_SECOND_IF, &arp, sizeof(arp));
+    ck_assert_uint_eq(last_frame_sent_count, frames_before);
+
+    /* Control: a request for the primary's IP on the configured primary
+     * is still answered. */
+    ll = wolfIP_getdev_ex(&s, TEST_PRIMARY_IF);
+    conf = wolfIP_ipconf_at(&s, TEST_PRIMARY_IF);
+    memset(&arp, 0, sizeof(arp));
+    memcpy(arp.eth.dst, ll->mac, 6);
+    memcpy(arp.eth.src, fake_mac, 6);
+    arp.eth.type = ee16(ETH_TYPE_ARP);
+    arp.htype = ee16(1);
+    arp.ptype = ee16(0x0800);
+    arp.hlen = 6;
+    arp.plen = 4;
+    arp.opcode = ee16(ARP_REQUEST);
+    memcpy(arp.sma, fake_mac, 6);
+    arp.sip = ee32(0x0A000002U);
+    memset(arp.tma, 0, 6);
+    arp.tip = ee32(conf->ip);
+
+    frames_before = last_frame_sent_count;
+    arp_recv(&s, TEST_PRIMARY_IF, &arp, sizeof(arp));
+    ck_assert_uint_eq(last_frame_sent_count, frames_before + 1);
 }
 END_TEST
 

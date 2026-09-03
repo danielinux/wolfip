@@ -4461,6 +4461,53 @@ START_TEST(test_tcp_process_ts_ooo_segment_keeps_recent)
 }
 END_TEST
 
+/* The TS.Recent freshness test must compare both operands in
+ * the same byte-order domain. po.ts_val is host order while last_ts is
+ * stored in wire order (it is emitted verbatim as ECR); the old
+ * comparison swapped only the incoming value, so it ordered byte-swapped
+ * numbers. With TS.Recent = 1, TSval 256 is newer in host order (and
+ * tcp_paws_check accepts it), but 0x00010000 < 0x01000000 in the
+ * swapped domain, so the stale TS.Recent was kept; and with TS.Recent
+ * = 256 the swapped comparison even rolled it back to 1. */
+START_TEST(test_tcp_process_ts_recent_compare_host_order)
+{
+    struct wolfIP s;
+    struct tsocket *ts;
+    uint8_t buf[sizeof(struct wolfIP_tcp_seg) + TCP_OPTIONS_LEN];
+    struct wolfIP_tcp_seg *tcp = (struct wolfIP_tcp_seg *)buf;
+    struct tcp_opt_ts *opt = (struct tcp_opt_ts *)tcp->data;
+
+    wolfIP_init(&s);
+    ts = &s.tcpsockets[0];
+    memset(ts, 0, sizeof(*ts));
+    ts->proto = WI_IPPROTO_TCP;
+    ts->S = &s;
+    ts->sock.tcp.ack = 1000;     /* RCV.NXT == Last.ACK.sent (host order) */
+    ts->sock.tcp.last_ts = ee32(1);
+    ts->sock.tcp.ts_recent_valid = 1;
+
+    memset(buf, 0, sizeof(buf));
+    tcp->hlen = (TCP_HEADER_LEN + TCP_OPTIONS_LEN) << 2;
+    opt->opt = TCP_OPTION_TS;
+    opt->len = TCP_OPTION_TS_LEN;
+    opt->pad = TCP_OPTION_NOP;
+    opt->eoo = TCP_OPTION_EOO;
+
+    /* In-order segment with TSval 256 > TS.Recent 1: advance. */
+    tcp->seq = ee32(1000);
+    opt->val = ee32(256);
+    tcp_process_ts(ts, tcp, sizeof(buf));
+    ck_assert_uint_eq(ts->sock.tcp.last_ts, ee32(256));
+
+    /* Mirror image: TS.Recent 256, incoming TSval 1 is older in host
+     * order and must not roll TS.Recent back. */
+    tcp->seq = ee32(1000);
+    opt->val = ee32(1);
+    tcp_process_ts(ts, tcp, sizeof(buf));
+    ck_assert_uint_eq(ts->sock.tcp.last_ts, ee32(256));
+}
+END_TEST
+
 START_TEST(test_tcp_input_paws_ooo_does_not_poison_hole_fill)
 {
     struct wolfIP s;
