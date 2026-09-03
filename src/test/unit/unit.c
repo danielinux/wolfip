@@ -1678,6 +1678,7 @@ Suite *wolf_suite(void)
 #endif /* WOLFIP_PACKET_SOCKETS */
     tcase_add_test(tc_core, test_bind_port_in_use_different_ips_no_collision);
     tcase_add_test(tc_core, test_tcp_ctrl_rto_start_no_timer_does_not_set_active);
+    tcase_add_test(tc_core, test_tcp_ctrl_rto_start_rearm_failure_clears_active);
 
 #if WOLFIP_VLAN
     /* --- unit_tests_vlan.c (30 tests for 802.1Q support) --- */

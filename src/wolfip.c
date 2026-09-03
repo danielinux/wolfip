@@ -4017,6 +4017,9 @@ static int tcp_ctrl_rto_start(struct tsocket *t, uint64_t now)
      * it replaces must be cleared with the timer it armed. */
     t->sock.tcp.fin_wait_2_timeout_active = 0;
     t->sock.tcp.preaccept_timeout_active = 0;
+    /* Re-arms enter with the flag set by the prior arm: clear it up front
+     * so a failed insert cannot leave it set with no timer behind it. */
+    t->sock.tcp.ctrl_rto_active = 0;
     if (t->sock.tcp.tmr_rto != NO_TIMER) {
         timer_binheap_cancel(&t->S->timers, t->sock.tcp.tmr_rto);
         t->sock.tcp.tmr_rto = NO_TIMER;

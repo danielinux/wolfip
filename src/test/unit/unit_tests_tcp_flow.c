@@ -5919,3 +5919,37 @@ START_TEST(test_tcp_ctrl_rto_start_no_timer_does_not_set_active)
     ck_assert_int_eq(ts->sock.tcp.ctrl_rto_active, 0);
 }
 END_TEST
+
+/* A re-arm (the normal retransmit path) enters with ctrl_rto_active set by
+ * the prior arm: if the re-insert into a full heap fails, the flag must not
+ * survive - an active flag with no timer behind it wedges the socket the
+ * same way a failed first arm does. */
+START_TEST(test_tcp_ctrl_rto_start_rearm_failure_clears_active)
+{
+    struct wolfIP s;
+    struct tsocket *ts;
+    struct wolfIP_timer t = {0};
+    int i;
+
+    wolfIP_init(&s);
+    t.cb = tcp_rto_cb;
+    for (i = 0; i < MAX_TIMERS; i++) {
+        t.arg = (void *)(intptr_t)i;
+        t.expires = s.last_tick + 1000 + i;
+        timers_binheap_insert(&s.timers, t);
+    }
+    ts = &s.tcpsockets[0];
+    ts->S = &s;
+    ts->proto = WI_IPPROTO_TCP;
+    ts->sock.tcp.rto = 1000;
+    ts->sock.tcp.ctrl_rto_retries = 0;
+    ts->sock.tcp.tmr_rto = NO_TIMER;
+    /* State at the start of a retransmit: the prior arm succeeded and its
+     * timer has since fired, so the flag is set and the slot is empty. */
+    ts->sock.tcp.ctrl_rto_active = 1;
+    tcp_ctrl_rto_start(ts, s.last_tick);
+    /* Heap full: the re-insert failed, so the flag must be cleared. */
+    ck_assert_int_eq(ts->sock.tcp.tmr_rto, NO_TIMER);
+    ck_assert_int_eq(ts->sock.tcp.ctrl_rto_active, 0);
+}
+END_TEST
