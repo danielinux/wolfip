@@ -2451,17 +2451,17 @@ static void wolfIP_send_frag_needed(struct wolfIP *s, unsigned int in_if,
      * the datagram as exists. */
     orig_total = ee16(orig->len);
     if (orig_total < orig_ihl)
-        orig_total = orig_ihl;
+        return; /* malformed: IP total length smaller than the header */
     orig_copy = orig_ihl + 8;
     if (orig_copy > orig_total)
         orig_copy = orig_total;
     if (orig_copy > TTL_EXCEEDED_ORIG_PACKET_SIZE_MAX)
         orig_copy = TTL_EXCEEDED_ORIG_PACKET_SIZE_MAX;
     icmp_data_len = 8 + orig_copy; /* ICMP header + quoted packet */
-    /* Next-hop MTU: the IP payload MTU of the egress link the datagram was
-     * to be relayed on (network order in the field's two low bytes). Set
-     * before the checksum: the field lies inside the ICMP checksummed range.
-     */
+    /* Next-hop MTU: the IP MTU (max IP datagram size, header included) of
+     * the egress link the datagram was to be relayed on (network order in
+     * the field's two low bytes). Set before the checksum: the field lies
+     * inside the ICMP checksummed range. */
     mtu_net = ee16((uint16_t)wolfIP_ip_mtu(s, out_if));
     memcpy(&icmp.unused[2], &mtu_net, sizeof(mtu_net));
     icmp.type = ICMP_DEST_UNREACH;
@@ -2496,7 +2496,14 @@ static void wolfIP_send_frag_needed(struct wolfIP *s, unsigned int in_if,
     }
 #ifdef WOLFIP_ESP
     if (!wolfIP_ll_is_non_ethernet(s, in_if)) {
-        if (esp_send(ll, &icmp.ip, (uint16_t)(frame_len - ETH_HEADER_LEN)) == 1) {
+        struct wolfIP_ll_dev *esp_ll = ll;
+#if WOLFIP_VLAN
+        /* A VLAN sub-iface has no send function of its own; esp_send needs
+         * the physical device's send path. */
+        if (ll->vlan_active && ll->vlan_parent)
+            esp_ll = ll->vlan_parent;
+#endif
+        if (esp_send(esp_ll, &icmp.ip, (uint16_t)(frame_len - ETH_HEADER_LEN)) == 1) {
             wolfIP_ll_send_frame(s, in_if, &icmp, frame_len);
         }
     } else {
@@ -7104,8 +7111,7 @@ int wolfIP_sock_sendto(struct wolfIP *s, int sockfd, const void *buf, size_t len
          * (udp_try_recv bound_match) and getsockname is sane. */
         if (ts->local_ip == 0)
             ts->local_ip = src_ip;
-        if (ts->if_idx == 0)
-            ts->if_idx = (uint8_t)if_idx;
+        ts->if_idx = (uint8_t)if_idx;
         ip_mtu = wolfIP_ip_mtu(s, if_idx);
         if (ip_mtu <= (IP_HEADER_LEN + UDP_HEADER_LEN) ||
                 len > ip_mtu - IP_HEADER_LEN - UDP_HEADER_LEN)
