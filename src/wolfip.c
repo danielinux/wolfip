@@ -2397,6 +2397,127 @@ static void wolfIP_send_ttl_exceeded(struct wolfIP *s, unsigned int if_idx,
 }
 #endif
 
+#if WOLFIP_ENABLE_FORWARDING && defined(ETHERNET)
+/* RFC 1812 4.3.2.4: a router that cannot relay a DF-set datagram because it
+ * exceeds the egress MTU answers the source with Fragmentation Needed
+ * (code 4); the 32-bit next-hop field after the checksum carries the MTU of
+ * the egress link. The reply goes out the interface the datagram arrived on,
+ * addressed to the datagram's source (the sender is attached to that link).
+ */
+static void wolfIP_send_frag_needed(struct wolfIP *s, unsigned int in_if,
+                                    unsigned int out_if,
+                                    struct wolfIP_ip_packet *orig)
+{
+    struct wolfIP_ll_dev *ll = wolfIP_ll_at(s, in_if);
+    struct wolfIP_icmp_dest_unreachable_packet icmp = {0};
+    struct wolfIP_icmp_packet *icmp_pkt = (struct wolfIP_icmp_packet *)&icmp;
+    uint32_t orig_ihl = (orig->ver_ihl & 0x0F) * 4;
+    uint32_t orig_total;
+    uint32_t orig_copy;
+    uint32_t icmp_data_len;
+    uint32_t frame_len;
+    uint16_t mtu_net;
+#if !CONFIG_IPFILTER
+    (void)icmp_pkt;
+#endif
+    if (!ll)
+        return;
+#if WOLFIP_VLAN
+    /* Same interface-validity rule as wolfIP_ll_send_frame: an active VLAN
+     * sub-iface has a NULL send and delegates to its parent. */
+    if (ll->vlan_active) {
+        if (!ll->vlan_parent)
+            return;
+    } else if (!ll->send) {
+        return;
+    }
+#else
+    if (!ll->send)
+        return;
+#endif
+    if (orig_ihl < IP_HEADER_LEN)
+        orig_ihl = IP_HEADER_LEN;
+    /* RFC 1812 4.3.2.7: an ICMP error MUST NOT be originated in response to
+     * another ICMP error (type 3, 4, 5, 11, 12). A zero-payload ICMP cannot
+     * be an error, so it is never suppressed. */
+    if (orig->proto == WI_IPPROTO_ICMP && ee16(orig->len) > orig_ihl) {
+        uint8_t orig_type = *(((uint8_t *)orig) + ETH_HEADER_LEN + orig_ihl);
+        if (orig_type == ICMP_DEST_UNREACH || orig_type == ICMP_FRAG_NEEDED ||
+            orig_type == 5 /* Redirect */ || orig_type == ICMP_TTL_EXCEEDED ||
+            orig_type == 12 /* Parameter Problem */)
+            return;
+    }
+    /* Quote the original header plus up to 8 payload bytes, or as much of
+     * the datagram as exists. */
+    orig_total = ee16(orig->len);
+    if (orig_total < orig_ihl)
+        orig_total = orig_ihl;
+    orig_copy = orig_ihl + 8;
+    if (orig_copy > orig_total)
+        orig_copy = orig_total;
+    if (orig_copy > TTL_EXCEEDED_ORIG_PACKET_SIZE_MAX)
+        orig_copy = TTL_EXCEEDED_ORIG_PACKET_SIZE_MAX;
+    icmp_data_len = 8 + orig_copy; /* ICMP header + quoted packet */
+    /* Next-hop MTU: the IP payload MTU of the egress link the datagram was
+     * to be relayed on (network order in the field's two low bytes). Set
+     * before the checksum: the field lies inside the ICMP checksummed range.
+     */
+    mtu_net = ee16((uint16_t)wolfIP_ip_mtu(s, out_if));
+    memcpy(&icmp.unused[2], &mtu_net, sizeof(mtu_net));
+    icmp.type = ICMP_DEST_UNREACH;
+    icmp.code = ICMP_FRAG_NEEDED;
+    /* RFC 1812 4.3.2.5: the error carries the triggering packet's TOS. */
+    icmp.ip.tos = orig->tos;
+    memcpy(icmp.orig_packet, ((uint8_t *)orig) + ETH_HEADER_LEN, orig_copy);
+    icmp.csum = ee16(icmp_checksum((struct wolfIP_icmp_packet *)&icmp,
+                icmp_data_len));
+    icmp.ip.ver_ihl = 0x45;
+    icmp.ip.flags_fo = ee16(0x4000U);
+    icmp.ip.ttl = 64;
+    icmp.ip.proto = WI_IPPROTO_ICMP;
+    icmp.ip.id = ipcounter_next(s);
+    icmp.ip.len = ee16((uint16_t)(IP_HEADER_LEN + icmp_data_len));
+    icmp.ip.src = ee32(wolfIP_ipconf_at(s, in_if)->ip);
+    icmp.ip.dst = orig->src;
+    icmp.ip.csum = 0;
+    iphdr_set_checksum(&icmp.ip);
+    frame_len = ETH_HEADER_LEN + IP_HEADER_LEN + icmp_data_len;
+    if (!wolfIP_ll_is_non_ethernet(s, in_if)) {
+        eth_output_add_header(s, in_if, orig->eth.src, &icmp.ip.eth, ETH_TYPE_IP);
+    }
+    if (wolfIP_filter_notify_icmp(WOLFIP_FILT_SENDING, s, in_if, icmp_pkt,
+                    frame_len, IP_HEADER_LEN) != 0)
+        return;
+    if (wolfIP_filter_notify_ip(WOLFIP_FILT_SENDING, s, in_if, &icmp.ip, frame_len) != 0)
+        return;
+    if (!wolfIP_ll_is_non_ethernet(s, in_if)) {
+        if (wolfIP_filter_notify_eth(WOLFIP_FILT_SENDING, s, in_if, &icmp.ip.eth, frame_len) != 0)
+            return;
+    }
+#ifdef WOLFIP_ESP
+    if (!wolfIP_ll_is_non_ethernet(s, in_if)) {
+        if (esp_send(ll, &icmp.ip, (uint16_t)(frame_len - ETH_HEADER_LEN)) == 1) {
+            wolfIP_ll_send_frame(s, in_if, &icmp, frame_len);
+        }
+    } else {
+        wolfIP_ll_send_frame(s, in_if, &icmp, frame_len);
+    }
+#else
+    wolfIP_ll_send_frame(s, in_if, &icmp, frame_len);
+#endif
+}
+#elif WOLFIP_ENABLE_FORWARDING
+static void wolfIP_send_frag_needed(struct wolfIP *s, unsigned int in_if,
+                                    unsigned int out_if,
+                                    struct wolfIP_ip_packet *orig)
+{
+    (void)s;
+    (void)in_if;
+    (void)out_if;
+    (void)orig;
+}
+#endif
+
 #ifdef ETHERNET
 static void wolfIP_send_port_unreachable(struct wolfIP *s, unsigned int if_idx,
                                          struct wolfIP_ip_packet *orig)
@@ -10566,6 +10687,16 @@ static inline void ip_recv(struct wolfIP *s, unsigned int if_idx,
 
                 if (ip->ttl <= 1) {
                     wolfIP_send_ttl_exceeded(s, if_idx, ip);
+                    return;
+                }
+                /* A datagram larger than the egress IP MTU cannot be relayed.
+                 * With DF set, RFC 1812 4.3.2.4 requires a Fragmentation
+                 * Needed reply carrying the egress next-hop MTU instead of a
+                 * silent drop; a DF-clear datagram that does not fit is
+                 * still dropped on transmit. */
+                if (ee16(ip->len) > wolfIP_ip_mtu(s, (unsigned int)out_if) &&
+                        (ee16(ip->flags_fo) & 0x4000U) != 0U) {
+                    wolfIP_send_frag_needed(s, if_idx, (unsigned int)out_if, ip);
                     return;
                 }
                 if (!wolfIP_forward_prepare(s, out_if, next_hop, mac,

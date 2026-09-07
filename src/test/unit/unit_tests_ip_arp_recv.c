@@ -1394,6 +1394,171 @@ START_TEST(test_forward_ttl_exceeded_copies_orig_tos)
 END_TEST
 
 /* =========================================================================
+ * ip_recv: DF-set datagram exceeding the egress MTU - Fragmentation Needed
+ * =========================================================================
+ * Branch: ee16(ip->len) > egress IP MTU and DF set -> wolfIP_send_frag_needed
+ * (ICMP 3/4 carrying the egress next-hop MTU), the datagram is not relayed.
+ */
+START_TEST(test_ip_recv_forward_df_oversize_sends_frag_needed)
+{
+    struct wolfIP s;
+    uint8_t frame[ETH_HEADER_LEN + IP_HEADER_LEN + 580];
+    struct wolfIP_ip_packet *ip = (struct wolfIP_ip_packet *)frame;
+    ip4 primary_ip   = 0x0A000001U;
+    ip4 secondary_ip = 0xC0A80101U;
+    ip4 dest_ip      = 0xC0A80155U;
+    ip4 src_ip       = 0x0A000002U;
+    static const uint8_t dest_mac[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+    struct wolfIP_icmp_packet *ic;
+
+    setup_stack_with_two_ifaces(&s, primary_ip, secondary_ip);
+    wolfIP_filter_set_callback(NULL, NULL);
+    /* Egress frame budget 590 bytes: IP MTU 576 (the IPv4 minimum). */
+    s.ll_dev[TEST_SECOND_IF].mtu = 590;
+
+    arp_store_neighbor(&s, TEST_SECOND_IF, dest_ip, dest_mac);
+    last_frame_sent_size = 0;
+
+    memset(frame, 0, sizeof(frame));
+    memcpy(ip->eth.dst, s.ll_dev[TEST_PRIMARY_IF].mac, 6);
+    memcpy(ip->eth.src, "\x01\x02\x03\x04\x05\x06", 6);
+    ip->eth.type = ee16(ETH_TYPE_IP);
+    ip->ver_ihl  = 0x45;
+    ip->flags_fo = ee16(0x4000U); /* DF set */
+    ip->ttl      = 64;
+    ip->proto    = WI_IPPROTO_UDP;
+    ip->len      = ee16(IP_HEADER_LEN + 580); /* 600 > egress MTU 576 */
+    ip->src      = ee32(src_ip);
+    ip->dst      = ee32(dest_ip);
+    fix_ip_checksum(ip);
+
+    ip_recv(&s, TEST_PRIMARY_IF, ip, (uint32_t)sizeof(frame));
+
+    /* Only the Fragmentation Needed reply is transmitted; the datagram
+     * itself is not relayed. */
+    ck_assert_uint_eq(last_frame_sent_count, 1);
+    /* 14 ETH + 20 IP + 8 ICMP + 28 quoted (20 header + 8 payload). */
+    ck_assert_uint_eq(last_frame_sent_size,
+            (uint32_t)(ETH_HEADER_LEN + IP_HEADER_LEN + 8 + IP_HEADER_LEN + 8));
+    ck_assert_uint_eq(last_frame_sent[ETH_HEADER_LEN + IP_HEADER_LEN],
+            ICMP_DEST_UNREACH);
+    ck_assert_uint_eq(last_frame_sent[ETH_HEADER_LEN + IP_HEADER_LEN + 1],
+            ICMP_FRAG_NEEDED);
+    /* Next-hop MTU (network order): 576 = 0x0240. */
+    ck_assert_uint_eq(last_frame_sent[ETH_HEADER_LEN + IP_HEADER_LEN + 6], 0x02);
+    ck_assert_uint_eq(last_frame_sent[ETH_HEADER_LEN + IP_HEADER_LEN + 7], 0x40);
+    /* Reply carries DF, TTL 64, from the ingress interface to the
+     * datagram's source. */
+    ck_assert_uint_eq(last_frame_sent[ETH_HEADER_LEN + 6], 0x40);
+    ck_assert_uint_eq(last_frame_sent[ETH_HEADER_LEN + 8], 64);
+    ck_assert_uint_eq(last_frame_sent[ETH_HEADER_LEN + 12], (primary_ip >> 24) & 0xFF);
+    ck_assert_uint_eq(last_frame_sent[ETH_HEADER_LEN + 16], (src_ip >> 24) & 0xFF);
+    /* Quoted original: version/IHL and source address. */
+    ck_assert_uint_eq(last_frame_sent[ETH_HEADER_LEN + IP_HEADER_LEN + 8], 0x45);
+    ck_assert_uint_eq(last_frame_sent[ETH_HEADER_LEN + IP_HEADER_LEN + 8 + 12],
+            (src_ip >> 24) & 0xFF);
+    /* The ICMP checksum must cover the next-hop MTU field. Pass the frame
+     * start: icmp_checksum() skips the eth+ip prefix of a
+     * wolfIP_icmp_packet before summing. */
+    ic = (struct wolfIP_icmp_packet *)(last_frame_sent +
+            ETH_HEADER_LEN + IP_HEADER_LEN);
+    ck_assert_uint_eq(ic->csum, ee16(icmp_checksum(
+            (struct wolfIP_icmp_packet *)last_frame_sent,
+            (uint16_t)(8 + IP_HEADER_LEN + 8))));
+}
+END_TEST
+
+/* =========================================================================
+ * ip_recv: DF-clear datagram exceeding the egress MTU - silent drop
+ * =========================================================================
+ * Branch: oversized but DF clear -> no Fragmentation Needed (fragmentation
+ * is a separate concern); the datagram is dropped on transmit.
+ */
+START_TEST(test_ip_recv_forward_nodf_oversize_dropped)
+{
+    struct wolfIP s;
+    uint8_t frame[ETH_HEADER_LEN + IP_HEADER_LEN + 580];
+    struct wolfIP_ip_packet *ip = (struct wolfIP_ip_packet *)frame;
+    ip4 primary_ip   = 0x0A000001U;
+    ip4 secondary_ip = 0xC0A80101U;
+    ip4 dest_ip      = 0xC0A80155U;
+    ip4 src_ip       = 0x0A000002U;
+    static const uint8_t dest_mac[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+
+    setup_stack_with_two_ifaces(&s, primary_ip, secondary_ip);
+    wolfIP_filter_set_callback(NULL, NULL);
+    s.ll_dev[TEST_SECOND_IF].mtu = 590;
+
+    arp_store_neighbor(&s, TEST_SECOND_IF, dest_ip, dest_mac);
+    last_frame_sent_size = 0;
+
+    memset(frame, 0, sizeof(frame));
+    memcpy(ip->eth.dst, s.ll_dev[TEST_PRIMARY_IF].mac, 6);
+    memcpy(ip->eth.src, "\x01\x02\x03\x04\x05\x06", 6);
+    ip->eth.type = ee16(ETH_TYPE_IP);
+    ip->ver_ihl  = 0x45;
+    ip->flags_fo = 0; /* DF clear */
+    ip->ttl      = 64;
+    ip->proto    = WI_IPPROTO_UDP;
+    ip->len      = ee16(IP_HEADER_LEN + 580);
+    ip->src      = ee32(src_ip);
+    ip->dst      = ee32(dest_ip);
+    fix_ip_checksum(ip);
+
+    ip_recv(&s, TEST_PRIMARY_IF, ip, (uint32_t)sizeof(frame));
+
+    /* Dropped on transmit, no ICMP of any kind. */
+    ck_assert_uint_eq(last_frame_sent_count, 0);
+}
+END_TEST
+
+/* =========================================================================
+ * ip_recv: DF-set datagram exactly at the egress MTU - forwarded
+ * =========================================================================
+ * Branch: ee16(ip->len) == egress IP MTU (not >) -> normal forward, no
+ * Fragmentation Needed.
+ */
+START_TEST(test_ip_recv_forward_df_at_mtu_forwarded)
+{
+    struct wolfIP s;
+    uint8_t frame[ETH_HEADER_LEN + IP_HEADER_LEN + 556];
+    struct wolfIP_ip_packet *ip = (struct wolfIP_ip_packet *)frame;
+    ip4 primary_ip   = 0x0A000001U;
+    ip4 secondary_ip = 0xC0A80101U;
+    ip4 dest_ip      = 0xC0A80155U;
+    ip4 src_ip       = 0x0A000002U;
+    static const uint8_t dest_mac[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+
+    setup_stack_with_two_ifaces(&s, primary_ip, secondary_ip);
+    wolfIP_filter_set_callback(NULL, NULL);
+    s.ll_dev[TEST_SECOND_IF].mtu = 590;
+
+    arp_store_neighbor(&s, TEST_SECOND_IF, dest_ip, dest_mac);
+    last_frame_sent_size = 0;
+
+    memset(frame, 0, sizeof(frame));
+    memcpy(ip->eth.dst, s.ll_dev[TEST_PRIMARY_IF].mac, 6);
+    memcpy(ip->eth.src, "\x01\x02\x03\x04\x05\x06", 6);
+    ip->eth.type = ee16(ETH_TYPE_IP);
+    ip->ver_ihl  = 0x45;
+    ip->flags_fo = ee16(0x4000U); /* DF set, but it fits */
+    ip->ttl      = 64;
+    ip->proto    = WI_IPPROTO_UDP;
+    ip->len      = ee16(IP_HEADER_LEN + 556); /* exactly 576 */
+    ip->src      = ee32(src_ip);
+    ip->dst      = ee32(dest_ip);
+    fix_ip_checksum(ip);
+
+    ip_recv(&s, TEST_PRIMARY_IF, ip, (uint32_t)sizeof(frame));
+
+    /* Forwarded as-is (TTL decremented), no ICMP generated. */
+    ck_assert_uint_eq(last_frame_sent_count, 1);
+    ck_assert_uint_eq(last_frame_sent_size, (uint32_t)sizeof(frame));
+    ck_assert_uint_eq(last_frame_sent[ETH_HEADER_LEN + 8], 63);
+}
+END_TEST
+
+/* =========================================================================
  * ip_recv: dest matches own IP on secondary interface → is_local=1, no fwd
  * =========================================================================
  * Branch: conf->ip == dest (in the loop) → is_local = 1
