@@ -975,6 +975,7 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_proto, test_icmp_input_dest_unreach_port_unreachable_mismatched_orig_src_port_ignored);
     tcase_add_test(tc_proto, test_icmp_input_dest_unreach_port_unreachable_mismatched_orig_dst_port_ignored);
     tcase_add_test(tc_proto, test_udp_sendto_and_recvfrom);
+    tcase_add_test(tc_proto, test_udp_sendto_unbound_socket_receives_reply);
     tcase_add_test(tc_proto, test_udp_wildcard_bind_receives_all_local_addrs);
     tcase_add_test(tc_proto, test_udp_sendto_respects_mtu_api);
     tcase_add_test(tc_proto, test_udp_recvfrom_sets_remote_ip);
@@ -1542,7 +1543,6 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_core, test_ip_recv_forward_df_oversize_sends_frag_needed);
     tcase_add_test(tc_core, test_ip_recv_forward_nodf_oversize_dropped);
     tcase_add_test(tc_core, test_ip_recv_forward_df_at_mtu_forwarded);
-    tcase_add_test(tc_core, test_ip_recv_forward_directed_bcast_to_attached_net);
     tcase_add_test(tc_core, test_ip_recv_forward_directed_bcast_ingress_net_not_forwarded);
     tcase_add_test(tc_core, test_ip_recv_dest_matches_secondary_iface_ip_is_local);
     tcase_add_test(tc_core, test_ip_recv_multicast_dst_not_forwarded);

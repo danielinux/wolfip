@@ -921,6 +921,50 @@ START_TEST(test_udp_sendto_and_recvfrom)
 }
 END_TEST
 
+START_TEST(test_udp_sendto_unbound_socket_receives_reply)
+{
+    struct wolfIP s;
+    int sd;
+    struct wolfIP_sockaddr_in sin;
+    struct wolfIP_sockaddr_in from;
+    socklen_t from_len = sizeof(from);
+    uint8_t payload[4] = {1, 2, 3, 4};
+    uint8_t rxbuf[8] = {0};
+    int ret;
+    ip4 local_ip = 0x0A000001U;
+    ip4 remote_ip = 0x0A000002U;
+    struct tsocket *ts;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    wolfIP_ipconfig_set(&s, local_ip, 0xFFFFFF00U, 0);
+
+    sd = wolfIP_sock_socket(&s, AF_INET, IPSTACK_SOCK_DGRAM, WI_IPPROTO_UDP);
+    ck_assert_int_gt(sd, 0);
+
+    /* No bind: a plain socket()/sendto() client. The egress state
+     * (local_ip/if_idx) must still be set so a reply is accepted. */
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = ee16(5000);
+    sin.sin_addr.s_addr = ee32(remote_ip);
+    ret = wolfIP_sock_sendto(&s, sd, payload, sizeof(payload), 0,
+            (struct wolfIP_sockaddr *)&sin, sizeof(sin));
+    ck_assert_int_eq(ret, (int)sizeof(payload));
+
+    ts = &s.udpsockets[SOCKET_UNMARK(sd)];
+    ck_assert_uint_gt(ts->src_port, 0);
+    inject_udp_datagram(&s, TEST_PRIMARY_IF, remote_ip, local_ip, 5000,
+            ts->src_port, payload, sizeof(payload));
+
+    memset(&from, 0, sizeof(from));
+    ret = wolfIP_sock_recvfrom(&s, sd, rxbuf, sizeof(rxbuf), 0,
+            (struct wolfIP_sockaddr *)&from, &from_len);
+    ck_assert_int_eq(ret, (int)sizeof(payload));
+    ck_assert_mem_eq(rxbuf, payload, sizeof(payload));
+}
+END_TEST
+
 START_TEST(test_udp_wildcard_bind_receives_all_local_addrs)
 {
     struct wolfIP s;

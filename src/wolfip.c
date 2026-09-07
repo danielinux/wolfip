@@ -7098,13 +7098,14 @@ int wolfIP_sock_sendto(struct wolfIP *s, int sockfd, const void *buf, size_t len
                     src_ip = primary->ip;
             }
         }
-        if (sin == NULL) {
-            /* A plain send to the connected peer binds the socket's
-             * egress state once, as before. */
+        /* Bind the socket's egress state once for any sendto (connected or
+         * not): an unbound socket that sends to an explicit destination must
+         * still get a local address + egress iface so replies are accepted
+         * (udp_try_recv bound_match) and getsockname is sane. */
+        if (ts->local_ip == 0)
+            ts->local_ip = src_ip;
+        if (ts->if_idx == 0)
             ts->if_idx = (uint8_t)if_idx;
-            if (ts->local_ip == 0)
-                ts->local_ip = src_ip;
-        }
         ip_mtu = wolfIP_ip_mtu(s, if_idx);
         if (ip_mtu <= (IP_HEADER_LEN + UDP_HEADER_LEN) ||
                 len > ip_mtu - IP_HEADER_LEN - UDP_HEADER_LEN)
@@ -10395,6 +10396,13 @@ int wolfIP_vlan_delete(struct wolfIP *s, unsigned int if_idx)
                 s->udpsockets[i].if_idx == (uint8_t)if_idx)
             return -WOLFIP_EBUSY;
     }
+#if WOLFIP_RAWSOCKETS
+    for (i = 0; i < WOLFIP_MAX_RAWSOCKETS; i++) {
+        if (s->rawsockets[i].used &&
+                s->rawsockets[i].if_idx == (uint8_t)if_idx)
+            return -WOLFIP_EBUSY;
+    }
+#endif
     /* Wipe the slot so it can be reused. s->if_count is not changed to avoid
      * renumbering active sub-ifaces. */
     memset(slot, 0, sizeof(*slot));
@@ -10645,13 +10653,11 @@ static inline void ip_recv(struct wolfIP *s, unsigned int if_idx,
             /* Limited broadcast: local-only, never forwarded. */
             is_local = 1;
         } else if (wolfIP_ip_is_broadcast(s, dest)) {
-            /* Directed broadcast: relay it out the egress for its network
-             * (the forward path emits it as a link-layer broadcast) only
-             * when a non-ingress egress exists; otherwise keep it local so
-             * a broadcast for the ingress's own network is not looped back
-             * to the sender. */
-            if (wolfIP_forward_interface(s, if_idx, dest) < 0)
-                is_local = 1;
+            /* Directed broadcast: local-only. The stack holds an address on
+             * the network, so local (wildcard) sockets receive it; relaying
+             * directed broadcasts is a smurf/amplification vector (RFC 2644)
+             * and is intentionally not forwarded. */
+            is_local = 1;
         } else {
             for (i = 0; i < s->if_count; i++) {
                 struct ipconf *conf = &s->ipconf[i];
