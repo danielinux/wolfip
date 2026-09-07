@@ -8256,7 +8256,11 @@ int wolfIP_sock_can_write(struct wolfIP *s, int sockfd)
             return -WOLFIP_EINVAL;
         if (ts->sock.tcp.state == TCP_SYN_SENT)
             return 0;
-        if (ts->sock.tcp.state != TCP_ESTABLISHED)
+        /* Only ESTABLISHED and CLOSE_WAIT accept data from send(), so both
+         * must reflect actual TX capacity; every other state keeps its
+         * fixed readiness. */
+        if (ts->sock.tcp.state != TCP_ESTABLISHED &&
+                ts->sock.tcp.state != TCP_CLOSE_WAIT)
             return 1;
         return tx_has_writable_space(ts) ? 1 : 0;
     }

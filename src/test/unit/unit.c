@@ -1196,6 +1196,7 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_core, test_sock_can_write_tcp_syn_sent_returns_zero);
     tcase_add_test(tc_core, test_sock_can_write_tcp_established_with_space);
     tcase_add_test(tc_core, test_sock_can_write_tcp_closed_returns_one);
+    tcase_add_test(tc_core, test_sock_can_write_tcp_close_wait_full_fifo_returns_zero);
     tcase_add_test(tc_core, test_sock_can_write_tcp_invalid_fd);
 #if WOLFIP_RAWSOCKETS
     tcase_add_test(tc_core, test_sock_can_read_raw_empty);
