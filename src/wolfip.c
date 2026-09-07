@@ -2462,7 +2462,7 @@ static void wolfIP_send_frag_needed(struct wolfIP *s, unsigned int in_if,
      * the egress link the datagram was to be relayed on (network order in
      * the field's two low bytes). Set before the checksum: the field lies
      * inside the ICMP checksummed range. */
-    mtu_net = ee16((uint16_t)wolfIP_ip_mtu(s, out_if));
+    mtu_net = ee16((uint16_t)(wolfIP_frame_mtu(s, out_if) - ETH_HEADER_LEN));
     memcpy(&icmp.unused[2], &mtu_net, sizeof(mtu_net));
     icmp.type = ICMP_DEST_UNREACH;
     icmp.code = ICMP_FRAG_NEEDED;
@@ -10773,7 +10773,8 @@ static inline void ip_recv(struct wolfIP *s, unsigned int if_idx,
                  * Needed reply carrying the egress next-hop MTU instead of a
                  * silent drop; a DF-clear datagram that does not fit is
                  * still dropped on transmit. */
-                if (ee16(ip->len) > wolfIP_ip_mtu(s, (unsigned int)out_if) &&
+                if (ee16(ip->len) >
+                        (wolfIP_frame_mtu(s, (unsigned int)out_if) - ETH_HEADER_LEN) &&
                         (ee16(ip->flags_fo) & 0x4000U) != 0U) {
                     wolfIP_send_frag_needed(s, if_idx, (unsigned int)out_if, ip);
                     return;
