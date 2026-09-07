@@ -624,6 +624,76 @@ START_TEST(test_vlan_api_delete_bad_ifidx_rejected)
 }
 END_TEST
 
+/* Regression (F-13166): deleting a VLAN while interface-dependent state still
+ * references its index must be rejected. wolfIP_vlan_create reuses the freed
+ * slot, so a stale route/mcast membership/socket on that index would silently
+ * operate through a newly created VLAN (wrong-VLAN traffic and membership
+ * reports). Each test adds one dependency, expects -WOLFIP_EBUSY, releases it,
+ * and expects the delete to succeed. */
+
+#if WOLFIP_ENABLE_FORWARDING
+START_TEST(test_vlan_delete_rejected_with_route)
+{
+    struct wolfIP s;
+    unsigned int sub_idx = 0;
+    int ret;
+
+    setup_vlan_stack(&s);
+
+    ret = wolfIP_vlan_create(&s, TEST_PRIMARY_IF, 100, 0, 0, &sub_idx);
+    ck_assert_int_eq(ret, 0);
+
+    /* A route via the VLAN keeps it busy. */
+    ret = wolfIP_route_add(&s, sub_idx, 0x0A010000U, 16, 0);
+    ck_assert_int_eq(ret, 0);
+
+    ret = wolfIP_vlan_delete(&s, sub_idx);
+    ck_assert_int_eq(ret, -WOLFIP_EBUSY);
+
+    /* The VLAN survives a rejected delete. */
+    ck_assert_uint_eq(s.ll_dev[sub_idx].vlan_active, 1U);
+
+    /* Release the route; deletion now succeeds. */
+    ret = wolfIP_route_delete(&s, sub_idx, 0x0A010000U, 16);
+    ck_assert_int_eq(ret, 0);
+    ret = wolfIP_vlan_delete(&s, sub_idx);
+    ck_assert_int_eq(ret, 0);
+}
+END_TEST
+#endif /* WOLFIP_ENABLE_FORWARDING */
+
+START_TEST(test_vlan_delete_rejected_with_socket)
+{
+    struct wolfIP s;
+    unsigned int sub_idx = 0;
+    int sd;
+    struct tsocket *ts;
+    int ret;
+
+    setup_vlan_stack(&s);
+
+    ret = wolfIP_vlan_create(&s, TEST_PRIMARY_IF, 100, 0, 0, &sub_idx);
+    ck_assert_int_eq(ret, 0);
+
+    /* A socket bound to the VLAN keeps it busy. */
+    sd = wolfIP_sock_socket(&s, AF_INET, IPSTACK_SOCK_DGRAM, WI_IPPROTO_UDP);
+    ck_assert_int_gt(sd, 0);
+    ts = &s.udpsockets[SOCKET_UNMARK(sd)];
+    ts->if_idx = (uint8_t)sub_idx;
+
+    ret = wolfIP_vlan_delete(&s, sub_idx);
+    ck_assert_int_eq(ret, -WOLFIP_EBUSY);
+
+    /* The socket survives a rejected delete (it belongs to the app). */
+    ck_assert_uint_eq(ts->if_idx, (uint8_t)sub_idx);
+
+    /* Closing the socket releases the dependency; deletion now succeeds. */
+    ck_assert_int_eq(wolfIP_sock_close(&s, sd), 0);
+    ret = wolfIP_vlan_delete(&s, sub_idx);
+    ck_assert_int_eq(ret, 0);
+}
+END_TEST
+
 /* Regression: wolfIP_vlan_get used to default *parent_if_idx to 0 if the
  * parent pointer didn't match any slot in ll_dev[], silently reporting the
  * wrong parent. After the fix it must return -WOLFIP_EINVAL and leave the

@@ -179,6 +179,14 @@ typedef uint32_t ip4;
 #endif
 #endif
 
+#ifndef WOLFIP_EBUSY
+#ifdef EBUSY
+#define WOLFIP_EBUSY EBUSY
+#else
+#define WOLFIP_EBUSY (16)
+#endif
+#endif
+
 
 #ifdef DEBUG
 #include <stdio.h>

@@ -10363,10 +10363,38 @@ int wolfIP_vlan_create(struct wolfIP *s, unsigned int parent_if_idx,
 int wolfIP_vlan_delete(struct wolfIP *s, unsigned int if_idx)
 {
     struct wolfIP_ll_dev *slot;
+    int i;
     if (!s) return -WOLFIP_EINVAL;
     if (if_idx >= s->if_count) return -WOLFIP_EINVAL;
     slot = &s->ll_dev[if_idx];
     if (!slot->vlan_active || !slot->vlan_parent) return -WOLFIP_EINVAL;
+    /* Reject deletion while interface-dependent state still references this
+     * index: wolfIP_vlan_create reuses the freed slot, so a surviving route,
+     * multicast membership, or socket on this index would silently operate
+     * through a newly created VLAN (wrong-VLAN traffic and membership
+     * reports). The caller must release those dependencies first. */
+#if WOLFIP_ENABLE_FORWARDING
+    for (i = 0; i < (int)WOLFIP_MAX_ROUTES; i++) {
+        if (s->routes[i].used && s->routes[i].if_idx == (uint8_t)if_idx)
+            return -WOLFIP_EBUSY;
+    }
+#endif
+#ifdef IP_MULTICAST
+    for (i = 0; i < WOLFIP_MCAST_MEMBERSHIPS; i++) {
+        if (s->mcast[i].refs != 0 && s->mcast[i].if_idx == (uint8_t)if_idx)
+            return -WOLFIP_EBUSY;
+    }
+#endif
+    for (i = 0; i < MAX_TCPSOCKETS; i++) {
+        if (s->tcpsockets[i].proto != 0 &&
+                s->tcpsockets[i].if_idx == (uint8_t)if_idx)
+            return -WOLFIP_EBUSY;
+    }
+    for (i = 0; i < MAX_UDPSOCKETS; i++) {
+        if (s->udpsockets[i].proto != 0 &&
+                s->udpsockets[i].if_idx == (uint8_t)if_idx)
+            return -WOLFIP_EBUSY;
+    }
     /* Wipe the slot so it can be reused. s->if_count is not changed to avoid
      * renumbering active sub-ifaces. */
     memset(slot, 0, sizeof(*slot));
