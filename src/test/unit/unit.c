@@ -1542,6 +1542,8 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_core, test_ip_recv_forward_df_oversize_sends_frag_needed);
     tcase_add_test(tc_core, test_ip_recv_forward_nodf_oversize_dropped);
     tcase_add_test(tc_core, test_ip_recv_forward_df_at_mtu_forwarded);
+    tcase_add_test(tc_core, test_ip_recv_forward_directed_bcast_to_attached_net);
+    tcase_add_test(tc_core, test_ip_recv_forward_directed_bcast_ingress_net_not_forwarded);
     tcase_add_test(tc_core, test_ip_recv_dest_matches_secondary_iface_ip_is_local);
     tcase_add_test(tc_core, test_ip_recv_multicast_dst_not_forwarded);
     tcase_add_test(tc_core, test_arp_recv_htype_not_ethernet_dropped);

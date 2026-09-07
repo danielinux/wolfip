@@ -1558,6 +1558,88 @@ START_TEST(test_ip_recv_forward_df_at_mtu_forwarded)
 }
 END_TEST
 
+START_TEST(test_ip_recv_forward_directed_bcast_to_attached_net)
+{
+    struct wolfIP s;
+    uint8_t frame[ETH_HEADER_LEN + IP_HEADER_LEN + 8];
+    struct wolfIP_ip_packet *ip = (struct wolfIP_ip_packet *)frame;
+    ip4 primary_ip   = 0x0A000001U;   /* 10.0.0.1/24, ingress */
+    ip4 secondary_ip = 0xC0A80101U;   /* 192.168.1.1/24, egress */
+    ip4 dest_ip      = 0xC0A801FFU;   /* 192.168.1.255 directed bcast */
+    ip4 src_ip       = 0x0A000002U;   /* 10.0.0.2 on the ingress net */
+    int i;
+
+    setup_stack_with_two_ifaces(&s, primary_ip, secondary_ip);
+    wolfIP_filter_set_callback(NULL, NULL);
+    last_frame_sent_size = 0;
+
+    memset(frame, 0, sizeof(frame));
+    /* Received as a unicast L2 frame to the gateway (group bit clear), so
+     * the forward path is reachable; the IP dst is the directed broadcast
+     * for the attached secondary network. */
+    memcpy(ip->eth.dst, s.ll_dev[TEST_PRIMARY_IF].mac, 6);
+    memcpy(ip->eth.src, "\x01\x02\x03\x04\x05\x06", 6);
+    ip->eth.type = ee16(ETH_TYPE_IP);
+    ip->ver_ihl  = 0x45;
+    ip->flags_fo = ee16(0x4000U);
+    ip->ttl      = 64;
+    ip->proto    = WI_IPPROTO_UDP;
+    ip->len      = ee16(IP_HEADER_LEN + 8);
+    ip->src      = ee32(src_ip);
+    ip->dst      = ee32(dest_ip);
+    fix_ip_checksum(ip);
+
+    ip_recv(&s, TEST_PRIMARY_IF, ip, (uint32_t)sizeof(frame));
+
+    /* The directed broadcast for the attached secondary network is relayed
+     * out that interface as a link-layer broadcast. */
+    ck_assert_uint_eq(last_frame_sent_count, 1);
+    ck_assert_uint_eq(last_frame_sent_size,
+            (uint32_t)(ETH_HEADER_LEN + IP_HEADER_LEN + 8));
+    for (i = 0; i < 6; i++)
+        ck_assert_uint_eq(last_frame_sent[i], 0xFF);
+    /* IP dst is the directed broadcast; ttl decremented to 63. */
+    ck_assert_uint_eq(last_frame_sent[ETH_HEADER_LEN + 16],
+            (dest_ip >> 24) & 0xFF);
+    ck_assert_uint_eq(last_frame_sent[ETH_HEADER_LEN + 8], 63);
+}
+END_TEST
+
+START_TEST(test_ip_recv_forward_directed_bcast_ingress_net_not_forwarded)
+{
+    struct wolfIP s;
+    uint8_t frame[ETH_HEADER_LEN + IP_HEADER_LEN + 8];
+    struct wolfIP_ip_packet *ip = (struct wolfIP_ip_packet *)frame;
+    ip4 primary_ip   = 0x0A000001U;   /* 10.0.0.1/24, ingress */
+    ip4 secondary_ip = 0xC0A80101U;   /* 192.168.1.1/24 */
+    ip4 dest_ip      = 0x0A0000FFU;   /* 10.0.0.255 directed bcast */
+    ip4 src_ip       = 0x0A000002U;   /* 10.0.0.2 on the ingress net */
+
+    setup_stack_with_two_ifaces(&s, primary_ip, secondary_ip);
+    wolfIP_filter_set_callback(NULL, NULL);
+    last_frame_sent_size = 0;
+
+    memset(frame, 0, sizeof(frame));
+    memcpy(ip->eth.dst, s.ll_dev[TEST_PRIMARY_IF].mac, 6);
+    memcpy(ip->eth.src, "\x01\x02\x03\x04\x05\x06", 6);
+    ip->eth.type = ee16(ETH_TYPE_IP);
+    ip->ver_ihl  = 0x45;
+    ip->flags_fo = ee16(0x4000U);
+    ip->ttl      = 64;
+    ip->proto    = WI_IPPROTO_UDP;
+    ip->len      = ee16(IP_HEADER_LEN + 8);
+    ip->src      = ee32(src_ip);
+    ip->dst      = ee32(dest_ip);
+    fix_ip_checksum(ip);
+
+    ip_recv(&s, TEST_PRIMARY_IF, ip, (uint32_t)sizeof(frame));
+
+    /* A directed broadcast for the ingress's own network has no non-ingress
+     * egress, so it is not relayed back out (no loop). */
+    ck_assert_uint_eq(last_frame_sent_count, 0);
+}
+END_TEST
+
 /* =========================================================================
  * ip_recv: dest matches own IP on secondary interface → is_local=1, no fwd
  * =========================================================================

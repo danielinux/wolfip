@@ -10641,8 +10641,17 @@ static inline void ip_recv(struct wolfIP *s, unsigned int if_idx,
         if (!wolfIP_ll_is_non_ethernet(s, if_idx) && (ip->eth.dst[0] & 0x01))
             l2_group = 1;
 #endif
-        if (dest == IPADDR_ANY || wolfIP_ip_is_broadcast(s, dest)) {
+        if (dest == IPADDR_ANY) {
+            /* Limited broadcast: local-only, never forwarded. */
             is_local = 1;
+        } else if (wolfIP_ip_is_broadcast(s, dest)) {
+            /* Directed broadcast: relay it out the egress for its network
+             * (the forward path emits it as a link-layer broadcast) only
+             * when a non-ingress egress exists; otherwise keep it local so
+             * a broadcast for the ingress's own network is not looped back
+             * to the sender. */
+            if (wolfIP_forward_interface(s, if_idx, dest) < 0)
+                is_local = 1;
         } else {
             for (i = 0; i < s->if_count; i++) {
                 struct ipconf *conf = &s->ipconf[i];
