@@ -1347,7 +1347,7 @@ static inline uint32_t tcp_seq_inc(uint32_t seq, uint32_t n);
 static inline int tcp_seq_leq(uint32_t a, uint32_t b);
 static inline int tcp_seq_lt(uint32_t a, uint32_t b);
 static int ip_output_add_header(struct tsocket *t, struct wolfIP_ip_packet *ip,
-                                uint8_t proto, uint16_t len);
+                                uint8_t proto, ip4 src_ip, ip4 dst_ip, uint16_t len);
 static void tcp_persist_cb(void *arg);
 static void tcp_persist_start(struct tsocket *t, uint64_t now);
 static void tcp_persist_stop(struct tsocket *t);
@@ -3770,6 +3770,7 @@ static int tcp_send_empty_immediate(struct tsocket *t, struct wolfIP_tcp_seg *tc
     tcp->ack = ee32(t->sock.tcp.ack);
     tcp->win = ee16(tcp_adv_win(t, 1));
     ip_output_add_header(t, (struct wolfIP_ip_packet *)tcp, WI_IPPROTO_TCP,
+            t->local_ip, t->remote_ip,
             (uint16_t)(frame_len - ETH_HEADER_LEN));
 #ifdef ETHERNET
     if (!wolfIP_ll_is_non_ethernet(t->S, tx_if))
@@ -4453,6 +4454,7 @@ static int tcp_send_zero_wnd_probe(struct tsocket *t)
     }
 #endif
     ip_output_add_header(t, (struct wolfIP_ip_packet *)probe, WI_IPPROTO_TCP,
+            t->local_ip, t->remote_ip,
             (uint16_t)(IP_HEADER_LEN + TCP_HEADER_LEN + opt_len + 1));
 #ifdef ETHERNET
     if (!wolfIP_ll_is_non_ethernet(t->S, tx_if))
@@ -4998,20 +5000,20 @@ static void wolfIP_forward_packet(struct wolfIP *s, unsigned int out_if,
 #endif
 
 static int ip_output_add_header(struct tsocket *t, struct wolfIP_ip_packet *ip,
-                                uint8_t proto, uint16_t len)
+                                uint8_t proto, ip4 src_ip, ip4 dst_ip, uint16_t len)
 {
     union transport_pseudo_header ph;
     memset(&ph, 0, sizeof(ph));
     memset(ip, 0, sizeof(struct wolfIP_ip_packet));
-    ip->src = ee32(t->local_ip);
-    ip->dst = ee32(t->remote_ip);
+    ip->src = ee32(src_ip);
+    ip->dst = ee32(dst_ip);
     ip->ver_ihl = 0x45;
     ip->tos = t->tos;
     ip->len = ee16(len);
     ip->flags_fo = (proto == WI_IPPROTO_TCP) ? ee16(0x4000U) : 0;
     ip->ttl = 64;
 #ifdef IP_MULTICAST
-    if (proto == WI_IPPROTO_UDP && wolfIP_ip_is_multicast(t->remote_ip))
+    if (proto == WI_IPPROTO_UDP && wolfIP_ip_is_multicast(dst_ip))
         ip->ttl = t->sock.udp.mcast_ttl;
 #endif
     ip->proto = proto;
@@ -7048,6 +7050,9 @@ int wolfIP_sock_sendto(struct wolfIP *s, int sockfd, const void *buf, size_t len
         const struct wolfIP_sockaddr_in *sin = (const struct wolfIP_sockaddr_in *)dest_addr;
         unsigned int if_idx;
         struct ipconf *conf;
+        uint16_t dst_port;
+        ip4 remote_ip;
+        ip4 src_ip;
         uint32_t ip_mtu;
         uint32_t frame_len;
         if (SOCKET_UNMARK(sockfd) >= MAX_UDPSOCKETS)
@@ -7057,13 +7062,19 @@ int wolfIP_sock_sendto(struct wolfIP *s, int sockfd, const void *buf, size_t len
         if ((ts->dst_port == 0) && (dest_addr == NULL))
             return -1;
         memset(udp, 0, sizeof(struct wolfIP_udp_datagram));
+        /* Per-datagram addressing: an explicit sendto destination applies
+         * to this datagram only. The connected peer and udp_try_recv's
+         * filter are set only by connect(), and must survive this send
+         * even when the validation below fails. */
+        dst_port = ts->dst_port;
+        remote_ip = ts->remote_ip;
         if (sin) {
             if (addrlen < sizeof(struct wolfIP_sockaddr_in))
                 return -1;
-            ts->dst_port = ee16(sin->sin_port);
-            ts->remote_ip = ee32(sin->sin_addr.s_addr);
+            dst_port = ee16(sin->sin_port);
+            remote_ip = ee32(sin->sin_addr.s_addr);
         }
-        if ((ts->dst_port==0) || (ts->remote_ip==0))
+        if ((dst_port == 0) || (remote_ip == 0))
             return -1;
         if (ts->src_port == 0) {
             ts->src_port = port_alloc_random(s->udpsockets, MAX_UDPSOCKETS,
@@ -7071,23 +7082,30 @@ int wolfIP_sock_sendto(struct wolfIP *s, int sockfd, const void *buf, size_t len
             if (ts->src_port == 0)
                 return -WOLFIP_EAGAIN;
         }
-        if_idx = wolfIP_route_for_ip(s, ts->remote_ip);
+        if_idx = wolfIP_route_for_ip(s, remote_ip);
 #ifdef IP_MULTICAST
-        if (wolfIP_ip_is_multicast(ts->remote_ip) && ts->sock.udp.mcast_if_set)
+        if (wolfIP_ip_is_multicast(remote_ip) && ts->sock.udp.mcast_if_set)
             if_idx = ts->sock.udp.mcast_if_idx;
 #endif
         conf = wolfIP_ipconf_at(s, if_idx);
-        ts->if_idx = (uint8_t)if_idx;
-        if (ts->local_ip == 0) {
+        src_ip = ts->local_ip;
+        if (src_ip == 0) {
             if (conf && conf->ip != IPADDR_ANY)
-                ts->local_ip = conf->ip;
+                src_ip = conf->ip;
             else {
                 struct ipconf *primary = wolfIP_primary_ipconf(s);
                 if (primary && primary->ip != IPADDR_ANY)
-                    ts->local_ip = primary->ip;
+                    src_ip = primary->ip;
             }
         }
-        ip_mtu = wolfIP_socket_ip_mtu(ts);
+        if (sin == NULL) {
+            /* A plain send to the connected peer binds the socket's
+             * egress state once, as before. */
+            ts->if_idx = (uint8_t)if_idx;
+            if (ts->local_ip == 0)
+                ts->local_ip = src_ip;
+        }
+        ip_mtu = wolfIP_ip_mtu(s, if_idx);
         if (ip_mtu <= (IP_HEADER_LEN + UDP_HEADER_LEN) ||
                 len > ip_mtu - IP_HEADER_LEN - UDP_HEADER_LEN)
             return -1; /* Fragmentation not supported */
@@ -7097,17 +7115,24 @@ int wolfIP_sock_sendto(struct wolfIP *s, int sockfd, const void *buf, size_t len
         }
 
         udp->src_port = ee16(ts->src_port);
-        udp->dst_port = ee16(ts->dst_port);
+        udp->dst_port = ee16(dst_port);
         udp->len = ee16(len + UDP_HEADER_LEN);
         udp->csum = 0;
         memcpy(udp->data, buf, len);
-        /* Pin the IP header to this datagram's destination/source while the
-         * socket's routing state still matches it; the flush only adds the
-         * link-layer header. */
-        ip_output_add_header(ts, &udp->ip, WI_IPPROTO_UDP,
+        /* Pin the IP header to this datagram's destination/source; the
+         * flush only adds the link-layer header. */
+        ip_output_add_header(ts, &udp->ip, WI_IPPROTO_UDP, src_ip, remote_ip,
                 (uint16_t)(frame_len - ETH_HEADER_LEN));
         if (fifo_push(&ts->sock.udp.txbuf, udp, frame_len) < 0)
             return -WOLFIP_EAGAIN;
+        if (sin && !ts->sock.udp.connected) {
+            /* An unconnected socket adopts the explicit destination as
+             * its last destination for subsequent plain sends (DHCP/DNS
+             * rely on it). A connected socket's peer is set only by
+             * connect() and survives a per-datagram sendto address. */
+            ts->dst_port = dst_port;
+            ts->remote_ip = remote_ip;
+        }
         return len;
     } else if (IS_SOCKET_ICMP(sockfd)) {
         const struct wolfIP_sockaddr_in *sin = (const struct wolfIP_sockaddr_in *)dest_addr;
@@ -7171,6 +7196,7 @@ int wolfIP_sock_sendto(struct wolfIP *s, int sockfd, const void *buf, size_t len
          * destination/source at enqueue time; the flush only adds the
          * link-layer header. */
         ip_output_add_header(ts, &icmp->ip, WI_IPPROTO_ICMP,
+                ts->local_ip, ts->remote_ip,
                 (uint16_t)(frame_len - ETH_HEADER_LEN));
         if (fifo_push(&ts->sock.udp.txbuf, icmp, frame_len) < 0)
             return -WOLFIP_EAGAIN;
@@ -11817,7 +11843,8 @@ static void flush_tcp_tx(struct wolfIP *s, uint64_t now)
                     ts->sock.tcp.last_ack = ts->sock.tcp.ack;
                     tcp->ack = ee32(ts->sock.tcp.ack);
                     tcp->win = ee16(tcp_adv_win(ts, 1));
-                    ip_output_add_header(ts, (struct wolfIP_ip_packet *)tcp, WI_IPPROTO_TCP, size);
+                    ip_output_add_header(ts, (struct wolfIP_ip_packet *)tcp, WI_IPPROTO_TCP,
+                ts->local_ip, ts->remote_ip, size);
 #ifdef ETHERNET
                     if (!wolfIP_ll_is_non_ethernet(ts->S, tx_if))
                         eth_output_add_header(ts->S, tx_if, ts->nexthop_mac, &tcp->ip.eth, ETH_TYPE_IP);

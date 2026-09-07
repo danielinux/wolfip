@@ -873,6 +873,8 @@ START_TEST(test_udp_sendto_and_recvfrom)
     uint16_t local_port = 4000;
     uint16_t remote_port = 5000;
     struct tsocket *ts;
+    struct wolfIP_udp_datagram *udp;
+    struct pkt_desc *desc;
 
     wolfIP_init(&s);
     mock_link_init(&s);
@@ -898,9 +900,14 @@ START_TEST(test_udp_sendto_and_recvfrom)
 
     ts = &s.udpsockets[SOCKET_UNMARK(sd)];
     ck_assert_uint_gt(ts->src_port, 0);
-    ck_assert_uint_eq(ts->dst_port, remote_port);
-    ck_assert_uint_eq(ts->remote_ip, remote_ip);
     ck_assert_uint_gt(fifo_len(&ts->sock.udp.txbuf), 0);
+    /* The sendto destination is encoded into the queued datagram; the
+     * socket is not connected, so no persistent peer is set. */
+    desc = fifo_peek(&ts->sock.udp.txbuf);
+    ck_assert_ptr_nonnull(desc);
+    udp = (struct wolfIP_udp_datagram *)(ts->txmem + desc->pos + sizeof(*desc));
+    ck_assert_uint_eq(ee16(udp->dst_port), remote_port);
+    ck_assert_uint_eq(ee32(udp->ip.dst), remote_ip);
 
     inject_udp_datagram(&s, TEST_PRIMARY_IF, remote_ip, local_ip, remote_port, local_port,
             payload, sizeof(payload));
@@ -3438,12 +3445,14 @@ START_TEST(test_sock_sendto_tcp_close_wait_allowed)
 }
 END_TEST
 
-START_TEST(test_sock_sendto_udp_sets_dest_and_assigns)
+START_TEST(test_sock_sendto_udp_encodes_dest_and_assigns_src_port)
 {
     struct wolfIP s;
     int udp_sd;
     struct tsocket *ts;
     struct wolfIP_sockaddr_in sin;
+    struct wolfIP_udp_datagram *udp;
+    struct pkt_desc *desc;
     uint8_t buf[4] = {1,2,3,4};
     ip4 local_ip = 0x0A000001U;
 
@@ -3464,10 +3473,15 @@ START_TEST(test_sock_sendto_udp_sets_dest_and_assigns)
 
     ck_assert_int_eq(wolfIP_sock_sendto(&s, udp_sd, buf, sizeof(buf), 0,
             (struct wolfIP_sockaddr *)&sin, sizeof(sin)), (int)sizeof(buf));
-    ck_assert_uint_eq(ts->dst_port, 9999U);
-    ck_assert_uint_eq(ts->remote_ip, 0x0A000002U);
     ck_assert_uint_ge(ts->src_port, 1024U);
-    ck_assert_uint_eq(ts->local_ip, local_ip);
+    /* The sendto destination is encoded into the queued datagram; the
+     * socket is not connected, so no persistent peer is set. */
+    desc = fifo_peek(&ts->sock.udp.txbuf);
+    ck_assert_ptr_nonnull(desc);
+    udp = (struct wolfIP_udp_datagram *)(ts->txmem + desc->pos + sizeof(*desc));
+    ck_assert_uint_eq(ee16(udp->dst_port), 9999U);
+    ck_assert_uint_eq(ee32(udp->ip.dst), 0x0A000002U);
+    ck_assert_uint_eq(ee32(udp->ip.src), local_ip);
 }
 END_TEST
 
@@ -3563,6 +3577,8 @@ START_TEST(test_sock_sendto_udp_primary_ip_fallback)
     int udp_sd;
     struct tsocket *ts;
     struct wolfIP_sockaddr_in sin;
+    struct wolfIP_udp_datagram *udp;
+    struct pkt_desc *desc;
     uint8_t buf[4] = {1,2,3,4};
     ip4 primary_ip = 0x0A000001U;
     ip4 secondary_ip = 0xC0A80101U;
@@ -3584,7 +3600,11 @@ START_TEST(test_sock_sendto_udp_primary_ip_fallback)
 
     ck_assert_int_eq(wolfIP_sock_sendto(&s, udp_sd, buf, sizeof(buf), 0,
             (struct wolfIP_sockaddr *)&sin, sizeof(sin)), (int)sizeof(buf));
-    ck_assert_uint_eq(ts->local_ip, primary_ip);
+    /* The fallback source address is encoded into the queued datagram. */
+    desc = fifo_peek(&ts->sock.udp.txbuf);
+    ck_assert_ptr_nonnull(desc);
+    udp = (struct wolfIP_udp_datagram *)(ts->txmem + desc->pos + sizeof(*desc));
+    ck_assert_uint_eq(ee32(udp->ip.src), primary_ip);
 }
 END_TEST
 
@@ -3613,6 +3633,134 @@ START_TEST(test_sock_sendto_udp_zero_port_in_addr)
 
     ck_assert_int_eq(wolfIP_sock_sendto(&s, udp_sd, buf, sizeof(buf), 0,
             (struct wolfIP_sockaddr *)&sin, sizeof(sin)), -1);
+}
+END_TEST
+
+/* A sendto to an alternate destination on a connected UDP socket must
+ * not steal the connected peer: the queued datagram carries the
+ * alternate destination, while the persistent peer and
+ * udp_try_recv's filter stay exactly as connect() set them. */
+START_TEST(test_udp_sendto_connected_alt_dest_keeps_peer)
+{
+    struct wolfIP s;
+    int udp_sd;
+    struct tsocket *ts;
+    struct wolfIP_sockaddr_in sin;
+    struct wolfIP_sockaddr_in from;
+    socklen_t peer_len = sizeof(struct wolfIP_sockaddr_in);
+    struct wolfIP_udp_datagram *udp;
+    struct pkt_desc *desc;
+    uint8_t buf[4] = {1, 2, 3, 4};
+    uint8_t rxbuf[16];
+    ip4 local_ip = 0x0A000001U;
+    ip4 peer1 = 0x0A000002U;
+    ip4 peer2 = 0x0A000003U;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    wolfIP_ipconfig_set(&s, local_ip, 0xFFFFFF00U, 0);
+
+    udp_sd = wolfIP_sock_socket(&s, AF_INET, IPSTACK_SOCK_DGRAM, WI_IPPROTO_UDP);
+    ck_assert_int_gt(udp_sd, 0);
+    ts = &s.udpsockets[SOCKET_UNMARK(udp_sd)];
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = ee16(5000);
+    sin.sin_addr.s_addr = ee32(local_ip);
+    ck_assert_int_eq(wolfIP_sock_bind(&s, udp_sd,
+            (struct wolfIP_sockaddr *)&sin, sizeof(sin)), 0);
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = ee16(6000);
+    sin.sin_addr.s_addr = ee32(peer1);
+    ck_assert_int_eq(wolfIP_sock_connect(&s, udp_sd,
+            (struct wolfIP_sockaddr *)&sin, sizeof(sin)), 0);
+    ck_assert_uint_eq(ts->remote_ip, peer1);
+    ck_assert_uint_eq(ts->dst_port, 6000);
+
+    /* Alternate-destination sendto: the datagram goes to peer2 ... */
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = ee16(7000);
+    sin.sin_addr.s_addr = ee32(peer2);
+    ck_assert_int_eq(wolfIP_sock_sendto(&s, udp_sd, buf, sizeof(buf), 0,
+            (struct wolfIP_sockaddr *)&sin, sizeof(sin)), (int)sizeof(buf));
+
+    desc = fifo_peek(&ts->sock.udp.txbuf);
+    ck_assert_ptr_nonnull(desc);
+    udp = (struct wolfIP_udp_datagram *)(ts->txmem + desc->pos + sizeof(*desc));
+    ck_assert_uint_eq(ee32(udp->ip.dst), peer2);
+    ck_assert_uint_eq(ee16(udp->dst_port), 7000);
+
+    /* ... but the connected peer and its receive filter are untouched. */
+    ck_assert_uint_eq(ts->remote_ip, peer1);
+    ck_assert_uint_eq(ts->dst_port, 6000);
+
+    /* A reply from the connected peer is still accepted ... */
+    inject_udp_datagram(&s, TEST_PRIMARY_IF, peer1, local_ip, 6000, 5000,
+            buf, sizeof(buf));
+    ck_assert_int_eq(wolfIP_sock_can_read(&s, udp_sd), 1);
+    memset(&from, 0, sizeof(from));
+    ck_assert_int_ge(wolfIP_sock_recvfrom(&s, udp_sd, rxbuf, sizeof(rxbuf), 0,
+            (struct wolfIP_sockaddr *)&from, &peer_len), (int)sizeof(buf));
+
+    /* ... while a datagram from the alternate peer is not. */
+    inject_udp_datagram(&s, TEST_PRIMARY_IF, peer2, local_ip, 7000, 5000,
+            buf, sizeof(buf));
+    ck_assert_int_eq(wolfIP_sock_can_read(&s, udp_sd), 0);
+}
+END_TEST
+
+/* A failed sendto (payload over the MTU) must not mutate the connected
+ * peer either: the destination resolution must not leave the socket's
+ * peer and receive filter changed when validation fails. */
+START_TEST(test_udp_sendto_connected_failed_sendto_keeps_peer)
+{
+    struct wolfIP s;
+    int udp_sd;
+    struct tsocket *ts;
+    struct wolfIP_sockaddr_in sin;
+    uint8_t big[1600];
+    ip4 local_ip = 0x0A000001U;
+    ip4 peer1 = 0x0A000002U;
+    ip4 peer2 = 0x0A000003U;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    wolfIP_ipconfig_set(&s, local_ip, 0xFFFFFF00U, 0);
+
+    udp_sd = wolfIP_sock_socket(&s, AF_INET, IPSTACK_SOCK_DGRAM, WI_IPPROTO_UDP);
+    ck_assert_int_gt(udp_sd, 0);
+    ts = &s.udpsockets[SOCKET_UNMARK(udp_sd)];
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = ee16(5000);
+    sin.sin_addr.s_addr = ee32(local_ip);
+    ck_assert_int_eq(wolfIP_sock_bind(&s, udp_sd,
+            (struct wolfIP_sockaddr *)&sin, sizeof(sin)), 0);
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = ee16(6000);
+    sin.sin_addr.s_addr = ee32(peer1);
+    ck_assert_int_eq(wolfIP_sock_connect(&s, udp_sd,
+            (struct wolfIP_sockaddr *)&sin, sizeof(sin)), 0);
+
+    memset(big, 0, sizeof(big));
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = ee16(7000);
+    sin.sin_addr.s_addr = ee32(peer2);
+    /* 1600 > ip_mtu(1522) - IP/UDP headers: the send must fail ... */
+    ck_assert_int_eq(wolfIP_sock_sendto(&s, udp_sd, big, sizeof(big), 0,
+            (struct wolfIP_sockaddr *)&sin, sizeof(sin)), -1);
+    /* ... and must leave the connected peer untouched. */
+    ck_assert_uint_eq(ts->remote_ip, peer1);
+    ck_assert_uint_eq(ts->dst_port, 6000);
+    ck_assert_uint_eq(fifo_len(&ts->sock.udp.txbuf), 0);
 }
 END_TEST
 
@@ -3685,6 +3833,8 @@ START_TEST(test_sock_sendto_udp_local_ip_from_primary)
     int udp_sd;
     struct tsocket *ts;
     struct wolfIP_sockaddr_in sin;
+    struct wolfIP_udp_datagram *udp;
+    struct pkt_desc *desc;
     uint8_t buf[4] = {1,2,3,4};
     ip4 primary_ip = 0x0A000001U;
 
@@ -3709,7 +3859,11 @@ START_TEST(test_sock_sendto_udp_local_ip_from_primary)
 
     ck_assert_int_eq(wolfIP_sock_sendto(&s, udp_sd, buf, sizeof(buf), 0,
             (struct wolfIP_sockaddr *)&sin, sizeof(sin)), (int)sizeof(buf));
-    ck_assert_uint_eq(ts->local_ip, primary_ip);
+    /* The fallback source address is encoded into the queued datagram. */
+    desc = fifo_peek(&ts->sock.udp.txbuf);
+    ck_assert_ptr_nonnull(desc);
+    udp = (struct wolfIP_udp_datagram *)(ts->txmem + desc->pos + sizeof(*desc));
+    ck_assert_uint_eq(ee32(udp->ip.src), primary_ip);
 }
 END_TEST
 

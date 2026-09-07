@@ -5070,7 +5070,8 @@ START_TEST(test_ip_output_add_header) {
     t.S = &S;
 
     // Run the function for a TCP packet
-    result = ip_output_add_header(&t, ip, WI_IPPROTO_TCP, 40);
+    result = ip_output_add_header(&t, ip, WI_IPPROTO_TCP, t.local_ip,
+            t.remote_ip, 40);
     ck_assert_int_eq(result, 0);
 
     // Validate IP header fields
@@ -5107,7 +5108,8 @@ START_TEST(test_ip_output_add_header_icmp)
     t.if_idx = TEST_PRIMARY_IF;
     mock_link_init(&S);
 
-    result = ip_output_add_header(&t, ip, WI_IPPROTO_ICMP, IP_HEADER_LEN + ICMP_HEADER_LEN);
+    result = ip_output_add_header(&t, ip, WI_IPPROTO_ICMP, t.local_ip,
+            t.remote_ip, IP_HEADER_LEN + ICMP_HEADER_LEN);
     ck_assert_int_eq(result, 0);
 
     icmp = (struct wolfIP_icmp_packet *)ip;
@@ -7357,7 +7359,8 @@ START_TEST(test_regression_udp_checksum_zero_substituted_with_ffff)
     udp.csum = 0;
 
     ip_output_add_header(ts, (struct wolfIP_ip_packet *)&udp,
-                         WI_IPPROTO_UDP, IP_HEADER_LEN + 8);
+                         WI_IPPROTO_UDP, ts->local_ip, ts->remote_ip,
+                         IP_HEADER_LEN + 8);
 
     /* The stored checksum must be 0xFFFF, not 0. */
     ck_assert_uint_ne(udp.csum, 0);

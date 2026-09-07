@@ -369,7 +369,7 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_utils, test_sock_connect_tcp_txbuf_full_does_not_enter_syn_sent);
     tcase_add_test(tc_utils, test_sock_sendto_more_error_paths);
     tcase_add_test(tc_utils, test_sock_sendto_udp_no_dest);
-    tcase_add_test(tc_utils, test_sock_sendto_udp_sets_dest_and_assigns);
+    tcase_add_test(tc_utils, test_sock_sendto_udp_encodes_dest_and_assigns_src_port);
     tcase_add_test(tc_utils, test_sock_sendto_udp_addrlen_short);
     tcase_add_test(tc_utils, test_sock_sendto_udp_len_too_large);
     tcase_add_test(tc_utils, test_sock_sendto_udp_fifo_full);
@@ -383,6 +383,8 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_utils, test_sock_sendto_udp_remote_ip_zero);
     tcase_add_test(tc_utils, test_sock_sendto_udp_primary_ip_fallback);
     tcase_add_test(tc_utils, test_sock_sendto_udp_zero_port_in_addr);
+    tcase_add_test(tc_utils, test_udp_sendto_connected_alt_dest_keeps_peer);
+    tcase_add_test(tc_utils, test_udp_sendto_connected_failed_sendto_keeps_peer);
     tcase_add_test(tc_utils, test_sock_sendto_udp_src_port_low_adjusts);
     tcase_add_test(tc_utils, test_sock_sendto_udp_local_ip_conf_null);
     tcase_add_test(tc_utils, test_sock_sendto_udp_local_ip_from_primary);
