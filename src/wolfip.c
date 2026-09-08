@@ -6860,14 +6860,19 @@ int wolfIP_sock_accept(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr *add
         if (SOCKET_UNMARK(sockfd) >= MAX_TCPSOCKETS)
             return -WOLFIP_EINVAL;
         ts = &s->tcpsockets[SOCKET_UNMARK(sockfd)];
-        if (ts->sock.tcp.state == TCP_ESTABLISHED &&
-                ts->sock.tcp.is_listener) {
+        if (ts->sock.tcp.is_listener &&
+                (ts->sock.tcp.state == TCP_ESTABLISHED ||
+                 ts->sock.tcp.state == TCP_CLOSE_WAIT)) {
             /* The network task can consume SYN, final ACK and initial
              * application data in one poll step before the listening task
              * runs. Preserve that completed connection in a child socket,
              * including its queued data, and restore this descriptor as the
              * listener. A shallow struct copy alone is not enough: the FIFO
-             * and queue carry pointers to their owning socket's storage. */
+             * and queue carry pointers to their owning socket's storage.
+             * A peer that also closed before accept() (CLOSE_WAIT) is handed
+             * over the same way: the application reads the queued bytes and
+             * then EOF, instead of accept() failing on a readable listener
+             * and spinning the poll loop until the pre-accept timeout. */
             newts = tcp_new_socket(s);
             if (!newts) {
                 tcp_listener_revert_to_listen(ts);
@@ -6878,8 +6883,19 @@ int wolfIP_sock_accept(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr *add
             newts->sock.tcp.is_listener = 0;
             newts->sock.tcp.preaccept_timeout_active = 0;
             newts->sock.tcp.rxbuf.data = newts->rxmem;
+            /* The timer ids belong to the listener: the revert below cancels
+             * them, so the child must not keep a copy it could cancel or
+             * restart later. tmr_rto is already stopped above. */
+            newts->sock.tcp.tmr_rto = NO_TIMER;
+            newts->sock.tcp.tmr_persist = NO_TIMER;
+            /* A wildcard listener leaves bound_local_ip unset; the accepted
+             * connection is bound to the address the SYN arrived on, as in
+             * the SYN_RCVD clone path below. */
+            newts->bound_local_ip = (ts->bound_local_ip != IPADDR_ANY) ?
+                ts->bound_local_ip : ts->local_ip;
             /* The only transmit data possible before accept is the SYN-ACK,
-             * which the ESTABLISHED transition proves was acknowledged.
+             * which the ESTABLISHED transition proves was acknowledged (a
+             * pure ACK, for the peer's FIN, is sent directly, not queued).
              * Do not carry a stale queued copy into the accepted stream. */
             fifo_init(&newts->sock.tcp.txbuf, newts->txmem, TXBUF_SIZE);
             if (sin) {
@@ -8254,7 +8270,12 @@ int wolfIP_sock_can_read(struct wolfIP *s, int sockfd)
     if (IS_SOCKET_TCP(sockfd)) {
         if (!ts)
             return -WOLFIP_EINVAL;
-        if (ts->sock.tcp.is_listener && ts->sock.tcp.state == TCP_SYN_RCVD)
+        /* A listener holding a pending connection is readable until the
+         * application accepts it, whatever stage the handshake reached:
+         * poll()/select() drivers learn about the connection only here, and
+         * the SYN_RCVD window is too short to rely on. */
+        if (ts->sock.tcp.is_listener && ts->sock.tcp.state != TCP_LISTEN &&
+                ts->sock.tcp.state != TCP_CLOSED)
             return 1;
         if (queue_len(&ts->sock.tcp.rxbuf) > 0)
             return 1;
