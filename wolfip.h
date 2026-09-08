@@ -179,6 +179,16 @@ typedef uint32_t ip4;
 #endif
 #endif
 
+#ifndef WOLFIP_EBUSY
+#ifdef EBUSY
+#define WOLFIP_EBUSY EBUSY
+#else
+/* Fallback for targets without a system EBUSY: the POSIX value, used
+ * best-effort (not guaranteed to match a non-POSIX libc). */
+#define WOLFIP_EBUSY (16)
+#endif
+#endif
+
 
 #ifdef DEBUG
 #include <stdio.h>

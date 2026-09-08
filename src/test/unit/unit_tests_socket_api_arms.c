@@ -206,6 +206,31 @@ START_TEST(test_sock_can_write_tcp_closed_returns_one)
 }
 END_TEST
 
+START_TEST(test_sock_can_write_tcp_close_wait_full_fifo_returns_zero)
+{
+    struct wolfIP s;
+    int sd;
+    struct tsocket *ts;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    sd = wolfIP_sock_socket(&s, AF_INET, IPSTACK_SOCK_STREAM, 0);
+    ck_assert_int_ge(sd, 0);
+    ts = &s.tcpsockets[SOCKET_UNMARK(sd)];
+    ts->sock.tcp.state = TCP_CLOSE_WAIT;
+
+    /* Writable while the TX FIFO has space, as in ESTABLISHED. */
+    ck_assert_int_eq(wolfIP_sock_can_write(&s, sd), 1);
+
+    /* A full FIFO makes a CLOSE_WAIT send return -WOLFIP_EAGAIN, so
+     * can_write must agree and report 0 (callers poll it to decide
+     * whether to send). */
+    while (enqueue_tcp_tx(ts, 16, TCP_FLAG_ACK | TCP_FLAG_PSH) == 0) {
+    }
+    ck_assert_int_eq(wolfIP_sock_can_write(&s, sd), 0);
+}
+END_TEST
+
 START_TEST(test_sock_can_write_tcp_invalid_fd)
 {
     struct wolfIP s;
