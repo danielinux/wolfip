@@ -6898,6 +6898,16 @@ int wolfIP_sock_accept(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr *add
              * pure ACK, for the peer's FIN, is sent directly, not queued).
              * Do not carry a stale queued copy into the accepted stream. */
             fifo_init(&newts->sock.tcp.txbuf, newts->txmem, TXBUF_SIZE);
+            /* Readiness follows the child's own buffers. The listener's
+             * CB_EVENT_READABLE means "a connection is pending accept" and
+             * would otherwise dispatch a read callback on an accepted socket
+             * whose RX queue is empty. */
+            newts->events = 0;
+            if ((queue_len(&newts->sock.tcp.rxbuf) > 0) ||
+                    (newts->sock.tcp.state == TCP_CLOSE_WAIT))
+                newts->events |= CB_EVENT_READABLE;
+            if (tx_has_writable_space(newts))
+                newts->events |= CB_EVENT_WRITABLE;
             if (sin) {
                 sin->sin_family = AF_INET;
                 sin->sin_port = ee16(newts->dst_port);

@@ -5675,6 +5675,9 @@ START_TEST(test_tcp_listener_preaccept_established_no_data_is_readable)
     ck_assert_uint_eq(child->sock.tcp.tmr_rto, NO_TIMER);
     ck_assert_uint_eq(child->sock.tcp.tmr_persist, NO_TIMER);
     ck_assert_uint_eq(child->bound_local_ip, LLK_LOCAL_IP);
+    /* No queued data: the child must not inherit the listener's
+     * "pending accept" readable flag. */
+    ck_assert_uint_eq(child->events, CB_EVENT_WRITABLE);
     ck_assert_int_eq(lsn->sock.tcp.state, TCP_LISTEN);
     ck_assert_int_eq(wolfIP_sock_can_read(&s, fd), 0);
 }
@@ -5720,6 +5723,8 @@ START_TEST(test_tcp_listener_preaccept_peer_fin_hands_off_close_wait)
     ck_assert_uint_eq(ee16(peer.sin_port), 41000);
     child = &s.tcpsockets[SOCKET_UNMARK(accepted)];
     ck_assert_int_eq(child->sock.tcp.state, TCP_CLOSE_WAIT);
+    /* EOF is a read event: the child is readable even with an empty queue. */
+    ck_assert_uint_eq(child->events & CB_EVENT_READABLE, CB_EVENT_READABLE);
     /* Nothing was sent before the FIN: the application reads EOF. */
     ck_assert_int_eq(wolfIP_sock_recv(&s, accepted, got, sizeof(got), 0), 0);
 
