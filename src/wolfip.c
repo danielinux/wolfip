@@ -6893,11 +6893,17 @@ int wolfIP_sock_accept(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr *add
              * the SYN_RCVD clone path below. */
             newts->bound_local_ip = (ts->bound_local_ip != IPADDR_ANY) ?
                 ts->bound_local_ip : ts->local_ip;
-            /* The only transmit data possible before accept is the SYN-ACK,
-             * which the ESTABLISHED transition proves was acknowledged (a
-             * pure ACK, for the peer's FIN, is sent directly, not queued).
-             * Do not carry a stale queued copy into the accepted stream. */
+            /* The only retransmittable segment possible before accept is the
+             * SYN-ACK, which the ESTABLISHED transition proves was
+             * acknowledged: do not carry a stale queued copy into the
+             * accepted stream. The FIFO can also hold a pure ACK for the
+             * peer's early data or FIN that flush_tcp_tx() has not sent yet
+             * (accept() from a socket callback runs before the flush), and
+             * an ACK occupies no sequence space, so nothing would ever
+             * retransmit it. Re-arm it on the child instead of leaving the
+             * peer waiting for its own retransmission timer. */
             fifo_init(&newts->sock.tcp.txbuf, newts->txmem, TXBUF_SIZE);
+            newts->sock.tcp.ack_retry_pending = 1;
             /* Readiness follows the child's own buffers. The listener's
              * CB_EVENT_READABLE means "a connection is pending accept" and
              * would otherwise dispatch a read callback on an accepted socket
@@ -8283,9 +8289,14 @@ int wolfIP_sock_can_read(struct wolfIP *s, int sockfd)
         /* A listener holding a pending connection is readable until the
          * application accepts it, whatever stage the handshake reached:
          * poll()/select() drivers learn about the connection only here, and
-         * the SYN_RCVD window is too short to rely on. */
-        if (ts->sock.tcp.is_listener && ts->sock.tcp.state != TCP_LISTEN &&
-                ts->sock.tcp.state != TCP_CLOSED)
+         * the SYN_RCVD window is too short to rely on. Only the states
+         * accept() can hand off qualify - a listener closed while holding a
+         * connection keeps is_listener set through FIN_WAIT_1/LAST_ACK and
+         * friends, where accept() and recv() both fail. */
+        if (ts->sock.tcp.is_listener &&
+                (ts->sock.tcp.state == TCP_SYN_RCVD ||
+                 ts->sock.tcp.state == TCP_ESTABLISHED ||
+                 ts->sock.tcp.state == TCP_CLOSE_WAIT))
             return 1;
         if (queue_len(&ts->sock.tcp.rxbuf) > 0)
             return 1;
