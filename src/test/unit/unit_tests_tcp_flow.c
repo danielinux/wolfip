@@ -5554,10 +5554,10 @@ START_TEST(test_tcp_listener_rst_from_holding_4tuple_releases_lock)
 }
 END_TEST
 
-/* The handshake completes before accept(): the listener is ESTABLISHED
- * with the pre-accept fast-fail timer armed. accept() can no longer
- * clone the connection, but it reverts the port to LISTEN so it is not
- * pinned, and new clients are served again. */
+/* The handshake and first application bytes may complete in the same poll
+ * step before the application gets scheduled to accept().  accept() must
+ * preserve that established connection and its receive queue while restoring
+ * the original descriptor as a fresh listener. */
 START_TEST(test_tcp_listener_preaccept_accept_reverts_port)
 {
     struct wolfIP s;
@@ -5566,6 +5566,9 @@ START_TEST(test_tcp_listener_preaccept_accept_reverts_port)
     struct wolfIP_sockaddr_in peer;
     socklen_t peer_len = sizeof(peer);
     const struct wolfIP_tcp_seg *out;
+    static const char banner[] = "SSH-2.0-test\r\n";
+    char got[sizeof(banner)];
+    int accepted;
 
     wolfIP_init(&s);
     mock_link_init(&s);
@@ -5583,12 +5586,24 @@ START_TEST(test_tcp_listener_preaccept_accept_reverts_port)
     /* The un-accepted established listener is time-boxed. */
     ck_assert_int_eq(lsn->sock.tcp.preaccept_timeout_active, 1);
     ck_assert_uint_ne(lsn->sock.tcp.tmr_rto, NO_TIMER);
+    ck_assert_int_eq(queue_insert(&lsn->sock.tcp.rxbuf, (void *)banner,
+                                  lsn->sock.tcp.ack,
+                                  (uint32_t)sizeof(banner)), 0);
 
-    /* accept() cannot clone an ESTABLISHED connection: it fails, but it
-     * reverts the port to LISTEN instead of leaving it pinned. */
+    /* A late accept succeeds and hands the queued banner to the child. */
     memset(&peer, 0, sizeof(peer));
-    ck_assert_int_eq(wolfIP_sock_accept(&s, fd,
-            (struct wolfIP_sockaddr *)&peer, &peer_len), -1);
+    accepted = wolfIP_sock_accept(&s, fd,
+            (struct wolfIP_sockaddr *)&peer, &peer_len);
+    ck_assert_int_ge(accepted, 0);
+    memset(got, 0, sizeof(got));
+    ck_assert_int_eq(wolfIP_sock_recv(&s, accepted, got, sizeof(got), 0),
+                     (int)sizeof(banner));
+    ck_assert_mem_eq(got, banner, sizeof(banner));
+    /* The accepted child is a full-duplex established stream. The SSH
+     * server writes its identification before its first read. */
+    ck_assert_int_eq(wolfIP_sock_send(&s, accepted, banner,
+                                      sizeof(banner), 0),
+                     (int)sizeof(banner));
     ck_assert_int_eq(lsn->sock.tcp.state, TCP_LISTEN);
     ck_assert_int_eq(lsn->sock.tcp.preaccept_timeout_active, 0);
     ck_assert_uint_eq(lsn->sock.tcp.tmr_rto, NO_TIMER);
@@ -5603,7 +5618,6 @@ START_TEST(test_tcp_listener_preaccept_accept_reverts_port)
     out = llk_last_tcp();
     ck_assert_ptr_nonnull(out);
     ck_assert(out->flags & (TCP_FLAG_SYN | TCP_FLAG_ACK));
-    ck_assert_uint_eq(ee16(out->dst_port), 42000);
 }
 END_TEST
 
@@ -5688,10 +5702,10 @@ START_TEST(test_tcp_listener_preaccept_revert_drains_connection_state)
      * must drop, or the next connection inherits a stale segment. */
     ck_assert_int_eq(fifo_is_empty(&lsn->sock.tcp.txbuf), 0);
 
-    /* accept() fails (ESTABLISHED) and reverts the port to LISTEN. */
+    /* The established connection is handed off and the listener is reset. */
     memset(&peer, 0, sizeof(peer));
-    ck_assert_int_eq(wolfIP_sock_accept(&s, fd,
-            (struct wolfIP_sockaddr *)&peer, &peer_len), -1);
+    ck_assert_int_ge(wolfIP_sock_accept(&s, fd,
+            (struct wolfIP_sockaddr *)&peer, &peer_len), 0);
     ck_assert_int_eq(lsn->sock.tcp.state, TCP_LISTEN);
 
     /* The dead connection's transport state is gone. */
@@ -5753,10 +5767,10 @@ START_TEST(test_tcp_listener_revert_restores_option_baseline)
     llk_complete_handshake(&s, lsn, LLK_ATT_IP, 41000, 1);
     ck_assert_int_eq(lsn->sock.tcp.state, TCP_ESTABLISHED);
 
-    /* accept() fails (ESTABLISHED) and reverts the port to LISTEN. */
+    /* Late accept preserves the connection and reverts the port to LISTEN. */
     memset(&peer, 0, sizeof(peer));
-    ck_assert_int_eq(wolfIP_sock_accept(&s, fd,
-            (struct wolfIP_sockaddr *)&peer, &peer_len), -1);
+    ck_assert_int_ge(wolfIP_sock_accept(&s, fd,
+            (struct wolfIP_sockaddr *)&peer, &peer_len), 0);
     ck_assert_int_eq(lsn->sock.tcp.state, TCP_LISTEN);
 
     /* The option baseline matches a freshly allocated socket. */

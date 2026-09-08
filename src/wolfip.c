@@ -6862,12 +6862,40 @@ int wolfIP_sock_accept(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr *add
         ts = &s->tcpsockets[SOCKET_UNMARK(sockfd)];
         if (ts->sock.tcp.state == TCP_ESTABLISHED &&
                 ts->sock.tcp.is_listener) {
-            /* The handshake completed before accept(): the connection can
-             * no longer be cloned (accept() only handles SYN_RCVD), and
-             * without this recovery the port would be pinned in
-             * ESTABLISHED forever. Revert the port to LISTEN. */
+            /* The network task can consume SYN, final ACK and initial
+             * application data in one poll step before the listening task
+             * runs. Preserve that completed connection in a child socket,
+             * including its queued data, and restore this descriptor as the
+             * listener. A shallow struct copy alone is not enough: the FIFO
+             * and queue carry pointers to their owning socket's storage. */
+            newts = tcp_new_socket(s);
+            if (!newts) {
+                tcp_listener_revert_to_listen(ts);
+                return -1;
+            }
+            tcp_preaccept_timeout_stop(ts);
+            *newts = *ts;
+            newts->sock.tcp.is_listener = 0;
+            newts->sock.tcp.preaccept_timeout_active = 0;
+            newts->sock.tcp.rxbuf.data = newts->rxmem;
+            /* The only transmit data possible before accept is the SYN-ACK,
+             * which the ESTABLISHED transition proves was acknowledged.
+             * Do not carry a stale queued copy into the accepted stream. */
+            fifo_init(&newts->sock.tcp.txbuf, newts->txmem, TXBUF_SIZE);
+            if (sin) {
+                sin->sin_family = AF_INET;
+                sin->sin_port = ee16(newts->dst_port);
+                sin->sin_addr.s_addr = ee32(newts->remote_ip);
+            }
             tcp_listener_revert_to_listen(ts);
-            return -1;
+            if (wolfIP_filter_notify_socket_event(
+                    WOLFIP_FILT_ACCEPTING, s, newts,
+                    newts->local_ip, newts->src_port,
+                    newts->remote_ip, newts->dst_port) != 0) {
+                close_socket(newts);
+                return -1;
+            }
+            return (newts - s->tcpsockets) | MARK_TCP_SOCKET;
         }
         if ((ts->sock.tcp.state != TCP_SYN_RCVD) && (ts->sock.tcp.state != TCP_LISTEN))
             return -1;
@@ -6988,6 +7016,8 @@ int wolfIP_sock_sendto(struct wolfIP *s, int sockfd, const void *buf, size_t len
             return -WOLFIP_EINVAL;
 
         ts = &s->tcpsockets[SOCKET_UNMARK(sockfd)];
+        if (ts->sock.tcp.state == TCP_SYN_RCVD)
+            return -WOLFIP_EAGAIN;
         if (ts->sock.tcp.state != TCP_ESTABLISHED &&
                 ts->sock.tcp.state != TCP_CLOSE_WAIT)
             return -1;
@@ -8224,6 +8254,8 @@ int wolfIP_sock_can_read(struct wolfIP *s, int sockfd)
     if (IS_SOCKET_TCP(sockfd)) {
         if (!ts)
             return -WOLFIP_EINVAL;
+        if (ts->sock.tcp.is_listener && ts->sock.tcp.state == TCP_SYN_RCVD)
+            return 1;
         if (queue_len(&ts->sock.tcp.rxbuf) > 0)
             return 1;
         if (ts->sock.tcp.state == TCP_CLOSE_WAIT || ts->sock.tcp.state == TCP_CLOSED)
@@ -8261,7 +8293,8 @@ int wolfIP_sock_can_write(struct wolfIP *s, int sockfd)
     if (IS_SOCKET_TCP(sockfd)) {
         if (!ts)
             return -WOLFIP_EINVAL;
-        if (ts->sock.tcp.state == TCP_SYN_SENT)
+        if (ts->sock.tcp.state == TCP_SYN_SENT ||
+                ts->sock.tcp.state == TCP_SYN_RCVD)
             return 0;
         /* Only ESTABLISHED and CLOSE_WAIT accept data from send(), so both
          * must reflect actual TX capacity; every other state keeps its
