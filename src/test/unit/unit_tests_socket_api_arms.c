@@ -125,6 +125,26 @@ START_TEST(test_sock_can_read_tcp_established_empty)
 }
 END_TEST
 
+START_TEST(test_sock_can_read_tcp_listener_syn_rcvd_returns_one)
+{
+    struct wolfIP s;
+    int sd;
+    struct tsocket *ts;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    sd = wolfIP_sock_socket(&s, AF_INET, IPSTACK_SOCK_STREAM, 0);
+    ck_assert_int_ge(sd, 0);
+    ts = &s.tcpsockets[SOCKET_UNMARK(sd)];
+    ts->sock.tcp.state = TCP_SYN_RCVD;
+    ts->sock.tcp.is_listener = 1;
+
+    /* A listening socket with a pending handshake must wake select/poll so
+     * the application calls accept() before the final ACK changes state. */
+    ck_assert_int_eq(wolfIP_sock_can_read(&s, sd), 1);
+}
+END_TEST
+
 START_TEST(test_sock_can_read_tcp_close_wait_returns_one)
 {
     struct wolfIP s;
@@ -165,6 +185,23 @@ START_TEST(test_sock_can_write_tcp_syn_sent_returns_zero)
     ck_assert_int_ge(sd, 0);
     ts = &s.tcpsockets[SOCKET_UNMARK(sd)];
     ts->sock.tcp.state = TCP_SYN_SENT;
+
+    ck_assert_int_eq(wolfIP_sock_can_write(&s, sd), 0);
+}
+END_TEST
+
+START_TEST(test_sock_can_write_tcp_syn_rcvd_returns_zero)
+{
+    struct wolfIP s;
+    int sd;
+    struct tsocket *ts;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    sd = wolfIP_sock_socket(&s, AF_INET, IPSTACK_SOCK_STREAM, 0);
+    ck_assert_int_ge(sd, 0);
+    ts = &s.tcpsockets[SOCKET_UNMARK(sd)];
+    ts->sock.tcp.state = TCP_SYN_RCVD;
 
     ck_assert_int_eq(wolfIP_sock_can_write(&s, sd), 0);
 }
@@ -831,6 +868,25 @@ START_TEST(test_sock_sendto_tcp_invalid_fd)
     ck_assert_int_eq(wolfIP_sock_sendto(&s, MARK_TCP_SOCKET | MAX_TCPSOCKETS,
                                          buf, sizeof(buf), 0, NULL, 0),
                      -WOLFIP_EINVAL);
+}
+END_TEST
+
+START_TEST(test_sock_sendto_tcp_syn_rcvd_returns_eagain)
+{
+    struct wolfIP s;
+    int sd;
+    struct tsocket *ts;
+    uint8_t buf[8] = {0};
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    sd = wolfIP_sock_socket(&s, AF_INET, IPSTACK_SOCK_STREAM, 0);
+    ck_assert_int_ge(sd, 0);
+    ts = &s.tcpsockets[SOCKET_UNMARK(sd)];
+    ts->sock.tcp.state = TCP_SYN_RCVD;
+
+    ck_assert_int_eq(wolfIP_sock_sendto(&s, sd, buf, sizeof(buf), 0, NULL, 0),
+                     -WOLFIP_EAGAIN);
 }
 END_TEST
 

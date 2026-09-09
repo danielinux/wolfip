@@ -615,6 +615,10 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_utils, test_tcp_listener_sustained_lock_one_syn_per_window);
     tcase_add_test(tc_utils, test_tcp_listener_rst_from_holding_4tuple_releases_lock);
     tcase_add_test(tc_utils, test_tcp_listener_preaccept_accept_reverts_port);
+    tcase_add_test(tc_utils, test_tcp_listener_preaccept_established_no_data_is_readable);
+    tcase_add_test(tc_utils, test_tcp_listener_preaccept_peer_fin_hands_off_close_wait);
+    tcase_add_test(tc_utils, test_tcp_listener_preaccept_handoff_reemits_queued_ack);
+    tcase_add_test(tc_utils, test_tcp_listener_closed_while_pending_is_not_readable);
     tcase_add_test(tc_utils, test_tcp_listener_preaccept_timeout_reverts_port);
     tcase_add_test(tc_utils, test_tcp_listener_preaccept_revert_drains_connection_state);
     tcase_add_test(tc_utils, test_tcp_listener_preaccept_close_rto_retransmits_finack);
@@ -1192,9 +1196,11 @@ Suite *wolf_suite(void)
     tcase_add_test(tc_core, test_register_callback_packet_oor_ignored);
 #endif
     tcase_add_test(tc_core, test_sock_can_read_tcp_established_empty);
+    tcase_add_test(tc_core, test_sock_can_read_tcp_listener_syn_rcvd_returns_one);
     tcase_add_test(tc_core, test_sock_can_read_tcp_close_wait_returns_one);
     tcase_add_test(tc_core, test_sock_can_read_tcp_invalid_fd);
     tcase_add_test(tc_core, test_sock_can_write_tcp_syn_sent_returns_zero);
+    tcase_add_test(tc_core, test_sock_can_write_tcp_syn_rcvd_returns_zero);
     tcase_add_test(tc_core, test_sock_can_write_tcp_established_with_space);
     tcase_add_test(tc_core, test_sock_can_write_tcp_closed_returns_one);
     tcase_add_test(tc_core, test_sock_can_write_tcp_close_wait_full_fifo_returns_zero);
@@ -1237,6 +1243,7 @@ Suite *wolf_suite(void)
 #endif
     tcase_add_test(tc_core, test_sock_sendto_tcp_established_sends_data);
     tcase_add_test(tc_core, test_sock_sendto_tcp_invalid_fd);
+    tcase_add_test(tc_core, test_sock_sendto_tcp_syn_rcvd_returns_eagain);
     tcase_add_test(tc_core, test_sock_sendto_tcp_close_wait_sends_data);
 #if WOLFIP_RAWSOCKETS
     tcase_add_test(tc_core, test_sock_sendto_raw_null_dest_uses_stored_remote_ip);

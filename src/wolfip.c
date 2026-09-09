@@ -6860,14 +6860,74 @@ int wolfIP_sock_accept(struct wolfIP *s, int sockfd, struct wolfIP_sockaddr *add
         if (SOCKET_UNMARK(sockfd) >= MAX_TCPSOCKETS)
             return -WOLFIP_EINVAL;
         ts = &s->tcpsockets[SOCKET_UNMARK(sockfd)];
-        if (ts->sock.tcp.state == TCP_ESTABLISHED &&
-                ts->sock.tcp.is_listener) {
-            /* The handshake completed before accept(): the connection can
-             * no longer be cloned (accept() only handles SYN_RCVD), and
-             * without this recovery the port would be pinned in
-             * ESTABLISHED forever. Revert the port to LISTEN. */
+        if (ts->sock.tcp.is_listener &&
+                (ts->sock.tcp.state == TCP_ESTABLISHED ||
+                 ts->sock.tcp.state == TCP_CLOSE_WAIT)) {
+            /* The network task can consume SYN, final ACK and initial
+             * application data in one poll step before the listening task
+             * runs. Preserve that completed connection in a child socket,
+             * including its queued data, and restore this descriptor as the
+             * listener. A shallow struct copy alone is not enough: the FIFO
+             * and queue carry pointers to their owning socket's storage.
+             * A peer that also closed before accept() (CLOSE_WAIT) is handed
+             * over the same way: the application reads the queued bytes and
+             * then EOF, instead of accept() failing on a readable listener
+             * and spinning the poll loop until the pre-accept timeout. */
+            newts = tcp_new_socket(s);
+            if (!newts) {
+                tcp_listener_revert_to_listen(ts);
+                return -1;
+            }
+            tcp_preaccept_timeout_stop(ts);
+            *newts = *ts;
+            newts->sock.tcp.is_listener = 0;
+            newts->sock.tcp.preaccept_timeout_active = 0;
+            newts->sock.tcp.rxbuf.data = newts->rxmem;
+            /* The timer ids belong to the listener: the revert below cancels
+             * them, so the child must not keep a copy it could cancel or
+             * restart later. tmr_rto is already stopped above. */
+            newts->sock.tcp.tmr_rto = NO_TIMER;
+            newts->sock.tcp.tmr_persist = NO_TIMER;
+            /* A wildcard listener leaves bound_local_ip unset; the accepted
+             * connection is bound to the address the SYN arrived on, as in
+             * the SYN_RCVD clone path below. */
+            newts->bound_local_ip = (ts->bound_local_ip != IPADDR_ANY) ?
+                ts->bound_local_ip : ts->local_ip;
+            /* The only retransmittable segment possible before accept is the
+             * SYN-ACK, which the ESTABLISHED transition proves was
+             * acknowledged: do not carry a stale queued copy into the
+             * accepted stream. The FIFO can also hold a pure ACK for the
+             * peer's early data or FIN that flush_tcp_tx() has not sent yet
+             * (accept() from a socket callback runs before the flush), and
+             * an ACK occupies no sequence space, so nothing would ever
+             * retransmit it. Re-arm it on the child instead of leaving the
+             * peer waiting for its own retransmission timer. */
+            fifo_init(&newts->sock.tcp.txbuf, newts->txmem, TXBUF_SIZE);
+            newts->sock.tcp.ack_retry_pending = 1;
+            /* Readiness follows the child's own buffers. The listener's
+             * CB_EVENT_READABLE means "a connection is pending accept" and
+             * would otherwise dispatch a read callback on an accepted socket
+             * whose RX queue is empty. */
+            newts->events = 0;
+            if ((queue_len(&newts->sock.tcp.rxbuf) > 0) ||
+                    (newts->sock.tcp.state == TCP_CLOSE_WAIT))
+                newts->events |= CB_EVENT_READABLE;
+            if (tx_has_writable_space(newts))
+                newts->events |= CB_EVENT_WRITABLE;
+            if (sin) {
+                sin->sin_family = AF_INET;
+                sin->sin_port = ee16(newts->dst_port);
+                sin->sin_addr.s_addr = ee32(newts->remote_ip);
+            }
             tcp_listener_revert_to_listen(ts);
-            return -1;
+            if (wolfIP_filter_notify_socket_event(
+                    WOLFIP_FILT_ACCEPTING, s, newts,
+                    newts->local_ip, newts->src_port,
+                    newts->remote_ip, newts->dst_port) != 0) {
+                close_socket(newts);
+                return -1;
+            }
+            return (newts - s->tcpsockets) | MARK_TCP_SOCKET;
         }
         if ((ts->sock.tcp.state != TCP_SYN_RCVD) && (ts->sock.tcp.state != TCP_LISTEN))
             return -1;
@@ -6988,6 +7048,8 @@ int wolfIP_sock_sendto(struct wolfIP *s, int sockfd, const void *buf, size_t len
             return -WOLFIP_EINVAL;
 
         ts = &s->tcpsockets[SOCKET_UNMARK(sockfd)];
+        if (ts->sock.tcp.state == TCP_SYN_RCVD)
+            return -WOLFIP_EAGAIN;
         if (ts->sock.tcp.state != TCP_ESTABLISHED &&
                 ts->sock.tcp.state != TCP_CLOSE_WAIT)
             return -1;
@@ -8224,6 +8286,18 @@ int wolfIP_sock_can_read(struct wolfIP *s, int sockfd)
     if (IS_SOCKET_TCP(sockfd)) {
         if (!ts)
             return -WOLFIP_EINVAL;
+        /* A listener holding a pending connection is readable until the
+         * application accepts it, whatever stage the handshake reached:
+         * poll()/select() drivers learn about the connection only here, and
+         * the SYN_RCVD window is too short to rely on. Only the states
+         * accept() can hand off qualify - a listener closed while holding a
+         * connection keeps is_listener set through FIN_WAIT_1/LAST_ACK and
+         * friends, where accept() and recv() both fail. */
+        if (ts->sock.tcp.is_listener &&
+                (ts->sock.tcp.state == TCP_SYN_RCVD ||
+                 ts->sock.tcp.state == TCP_ESTABLISHED ||
+                 ts->sock.tcp.state == TCP_CLOSE_WAIT))
+            return 1;
         if (queue_len(&ts->sock.tcp.rxbuf) > 0)
             return 1;
         if (ts->sock.tcp.state == TCP_CLOSE_WAIT || ts->sock.tcp.state == TCP_CLOSED)
@@ -8261,7 +8335,8 @@ int wolfIP_sock_can_write(struct wolfIP *s, int sockfd)
     if (IS_SOCKET_TCP(sockfd)) {
         if (!ts)
             return -WOLFIP_EINVAL;
-        if (ts->sock.tcp.state == TCP_SYN_SENT)
+        if (ts->sock.tcp.state == TCP_SYN_SENT ||
+                ts->sock.tcp.state == TCP_SYN_RCVD)
             return 0;
         /* Only ESTABLISHED and CLOSE_WAIT accept data from send(), so both
          * must reflect actual TX capacity; every other state keeps its

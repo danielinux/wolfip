@@ -5554,10 +5554,10 @@ START_TEST(test_tcp_listener_rst_from_holding_4tuple_releases_lock)
 }
 END_TEST
 
-/* The handshake completes before accept(): the listener is ESTABLISHED
- * with the pre-accept fast-fail timer armed. accept() can no longer
- * clone the connection, but it reverts the port to LISTEN so it is not
- * pinned, and new clients are served again. */
+/* The handshake and first application bytes may complete in the same poll
+ * step before the application gets scheduled to accept().  accept() must
+ * preserve that established connection and its receive queue while restoring
+ * the original descriptor as a fresh listener. */
 START_TEST(test_tcp_listener_preaccept_accept_reverts_port)
 {
     struct wolfIP s;
@@ -5566,6 +5566,9 @@ START_TEST(test_tcp_listener_preaccept_accept_reverts_port)
     struct wolfIP_sockaddr_in peer;
     socklen_t peer_len = sizeof(peer);
     const struct wolfIP_tcp_seg *out;
+    static const char banner[] = "SSH-2.0-test\r\n";
+    char got[sizeof(banner)];
+    int accepted;
 
     wolfIP_init(&s);
     mock_link_init(&s);
@@ -5583,12 +5586,24 @@ START_TEST(test_tcp_listener_preaccept_accept_reverts_port)
     /* The un-accepted established listener is time-boxed. */
     ck_assert_int_eq(lsn->sock.tcp.preaccept_timeout_active, 1);
     ck_assert_uint_ne(lsn->sock.tcp.tmr_rto, NO_TIMER);
+    ck_assert_int_eq(queue_insert(&lsn->sock.tcp.rxbuf, (void *)banner,
+                                  lsn->sock.tcp.ack,
+                                  (uint32_t)sizeof(banner)), 0);
 
-    /* accept() cannot clone an ESTABLISHED connection: it fails, but it
-     * reverts the port to LISTEN instead of leaving it pinned. */
+    /* A late accept succeeds and hands the queued banner to the child. */
     memset(&peer, 0, sizeof(peer));
-    ck_assert_int_eq(wolfIP_sock_accept(&s, fd,
-            (struct wolfIP_sockaddr *)&peer, &peer_len), -1);
+    accepted = wolfIP_sock_accept(&s, fd,
+            (struct wolfIP_sockaddr *)&peer, &peer_len);
+    ck_assert_int_ge(accepted, 0);
+    memset(got, 0, sizeof(got));
+    ck_assert_int_eq(wolfIP_sock_recv(&s, accepted, got, sizeof(got), 0),
+                     (int)sizeof(banner));
+    ck_assert_mem_eq(got, banner, sizeof(banner));
+    /* The accepted child is a full-duplex established stream. The SSH
+     * server writes its identification before its first read. */
+    ck_assert_int_eq(wolfIP_sock_send(&s, accepted, banner,
+                                      sizeof(banner), 0),
+                     (int)sizeof(banner));
     ck_assert_int_eq(lsn->sock.tcp.state, TCP_LISTEN);
     ck_assert_int_eq(lsn->sock.tcp.preaccept_timeout_active, 0);
     ck_assert_uint_eq(lsn->sock.tcp.tmr_rto, NO_TIMER);
@@ -5603,7 +5618,209 @@ START_TEST(test_tcp_listener_preaccept_accept_reverts_port)
     out = llk_last_tcp();
     ck_assert_ptr_nonnull(out);
     ck_assert(out->flags & (TCP_FLAG_SYN | TCP_FLAG_ACK));
-    ck_assert_uint_eq(ee16(out->dst_port), 42000);
+}
+END_TEST
+
+/* A peer that completes the handshake and then waits for the server to
+ * speak queues no data, so rxbuf stays empty. A poll()/select() driver
+ * learns about the pending connection only through can_read(), which must
+ * still report the listener readable, or the application never accepts and
+ * the pre-accept timer discards a healthy connection. The wildcard bind
+ * also checks that the child inherits the address the SYN arrived on. */
+START_TEST(test_tcp_listener_preaccept_established_no_data_is_readable)
+{
+    struct wolfIP s;
+    int fd;
+    int accepted;
+    struct tsocket *lsn;
+    struct tsocket *child;
+    struct wolfIP_sockaddr_in sin;
+    struct wolfIP_sockaddr_in peer;
+    socklen_t peer_len = sizeof(peer);
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    wolfIP_ipconfig_set(&s, LLK_LOCAL_IP, LLK_NET_MASK, 0);
+
+    fd = wolfIP_sock_socket(&s, AF_INET, IPSTACK_SOCK_STREAM, WI_IPPROTO_TCP);
+    ck_assert_int_gt(fd, 0);
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_port = ee16((uint16_t)LLK_LISTEN_PORT);
+    sin.sin_addr.s_addr = ee32(IPADDR_ANY);
+    ck_assert_int_eq(wolfIP_sock_bind(&s, fd, (struct wolfIP_sockaddr *)&sin,
+            sizeof(sin)), 0);
+    ck_assert_int_eq(wolfIP_sock_listen(&s, fd, 16), 0);
+    lsn = &s.tcpsockets[SOCKET_UNMARK(fd)];
+
+    llk_keep_arp_fresh(&s, LLK_ATT_IP);
+    llk_attacker_syn(&s, LLK_ATT_IP, 41000, 1, 0);
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_SYN_RCVD);
+    ck_assert_int_eq(wolfIP_sock_can_read(&s, fd), 1);
+
+    llk_complete_handshake(&s, lsn, LLK_ATT_IP, 41000, 1);
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_ESTABLISHED);
+    ck_assert_uint_eq(queue_len(&lsn->sock.tcp.rxbuf), 0);
+    ck_assert_int_eq(wolfIP_sock_can_read(&s, fd), 1);
+
+    memset(&peer, 0, sizeof(peer));
+    accepted = wolfIP_sock_accept(&s, fd,
+            (struct wolfIP_sockaddr *)&peer, &peer_len);
+    ck_assert_int_ge(accepted, 0);
+    child = &s.tcpsockets[SOCKET_UNMARK(accepted)];
+    ck_assert_int_eq(child->sock.tcp.state, TCP_ESTABLISHED);
+    ck_assert_int_eq(child->sock.tcp.is_listener, 0);
+    /* The listener's timers were cancelled by the revert: the child must
+     * not keep a copy of their ids. */
+    ck_assert_uint_eq(child->sock.tcp.tmr_rto, NO_TIMER);
+    ck_assert_uint_eq(child->sock.tcp.tmr_persist, NO_TIMER);
+    ck_assert_uint_eq(child->bound_local_ip, LLK_LOCAL_IP);
+    /* No queued data: the child must not inherit the listener's
+     * "pending accept" readable flag. */
+    ck_assert_uint_eq(child->events, CB_EVENT_WRITABLE);
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_LISTEN);
+    ck_assert_int_eq(wolfIP_sock_can_read(&s, fd), 0);
+}
+END_TEST
+
+/* The peer closes before the application accepts: the listener sits in
+ * CLOSE_WAIT and can_read() reports it readable, so accept() must hand the
+ * connection over rather than fail - a failing accept() on a permanently
+ * readable descriptor spins the poll loop until the pre-accept timeout. */
+START_TEST(test_tcp_listener_preaccept_peer_fin_hands_off_close_wait)
+{
+    struct wolfIP s;
+    int fd;
+    int accepted;
+    struct tsocket *lsn;
+    struct tsocket *child;
+    struct wolfIP_sockaddr_in peer;
+    socklen_t peer_len = sizeof(peer);
+    char got[8];
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    wolfIP_ipconfig_set(&s, LLK_LOCAL_IP, LLK_NET_MASK, 0);
+    fd = llk_open_listener(&s);
+    lsn = &s.tcpsockets[SOCKET_UNMARK(fd)];
+
+    llk_keep_arp_fresh(&s, LLK_ATT_IP);
+    llk_attacker_syn(&s, LLK_ATT_IP, 41000, 1, 0);
+    llk_complete_handshake(&s, lsn, LLK_ATT_IP, 41000, 1);
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_ESTABLISHED);
+
+    inject_tcp_segment(&s, TEST_PRIMARY_IF, LLK_ATT_IP, LLK_LOCAL_IP,
+                       41000, (uint16_t)LLK_LISTEN_PORT, 2,
+                       lsn->sock.tcp.seq, TCP_FLAG_ACK | TCP_FLAG_FIN);
+    (void)wolfIP_poll(&s, 2);
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_CLOSE_WAIT);
+    ck_assert_int_eq(wolfIP_sock_can_read(&s, fd), 1);
+
+    memset(&peer, 0, sizeof(peer));
+    accepted = wolfIP_sock_accept(&s, fd,
+            (struct wolfIP_sockaddr *)&peer, &peer_len);
+    ck_assert_int_ge(accepted, 0);
+    ck_assert_uint_eq(ee16(peer.sin_port), 41000);
+    child = &s.tcpsockets[SOCKET_UNMARK(accepted)];
+    ck_assert_int_eq(child->sock.tcp.state, TCP_CLOSE_WAIT);
+    /* EOF is a read event: the child is readable even with an empty queue. */
+    ck_assert_uint_eq(child->events & CB_EVENT_READABLE, CB_EVENT_READABLE);
+    /* Nothing was sent before the FIN: the application reads EOF. */
+    ck_assert_int_eq(wolfIP_sock_recv(&s, accepted, got, sizeof(got), 0), 0);
+
+    /* The port is a plain listener again, off the fast-fail timer. */
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_LISTEN);
+    ck_assert_int_eq(lsn->sock.tcp.preaccept_timeout_active, 0);
+    ck_assert_uint_eq(lsn->sock.tcp.tmr_rto, NO_TIMER);
+    ck_assert_int_eq(wolfIP_sock_can_read(&s, fd), 0);
+    ck_assert_int_eq(wolfIP_sock_accept(&s, fd,
+            (struct wolfIP_sockaddr *)&peer, &peer_len), -WOLFIP_EAGAIN);
+}
+END_TEST
+
+/* accept() called from a socket callback runs before flush_tcp_tx(), so the
+ * TX FIFO can still hold the pure ACK that tcp_input() queued for the peer's
+ * FIN. An ACK occupies no sequence space and is never retransmitted, so the
+ * hand-off must re-arm it on the child instead of dropping it. */
+START_TEST(test_tcp_listener_preaccept_handoff_reemits_queued_ack)
+{
+    struct wolfIP s;
+    int fd;
+    int accepted;
+    struct tsocket *lsn;
+    struct wolfIP_sockaddr_in peer;
+    socklen_t peer_len = sizeof(peer);
+    const struct wolfIP_tcp_seg *out;
+    uint32_t frames_before;
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    wolfIP_ipconfig_set(&s, LLK_LOCAL_IP, LLK_NET_MASK, 0);
+    fd = llk_open_listener(&s);
+    lsn = &s.tcpsockets[SOCKET_UNMARK(fd)];
+
+    llk_keep_arp_fresh(&s, LLK_ATT_IP);
+    llk_attacker_syn(&s, LLK_ATT_IP, 41000, 1, 0);
+    llk_complete_handshake(&s, lsn, LLK_ATT_IP, 41000, 1);
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_ESTABLISHED);
+
+    /* The FIN is processed but not yet flushed: its ACK sits in the FIFO. */
+    inject_tcp_segment(&s, TEST_PRIMARY_IF, LLK_ATT_IP, LLK_LOCAL_IP,
+                       41000, (uint16_t)LLK_LISTEN_PORT, 2,
+                       lsn->sock.tcp.seq, TCP_FLAG_ACK | TCP_FLAG_FIN);
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_CLOSE_WAIT);
+    ck_assert_int_eq(fifo_is_empty(&lsn->sock.tcp.txbuf), 0);
+
+    memset(&peer, 0, sizeof(peer));
+    frames_before = last_frame_sent_count;
+    accepted = wolfIP_sock_accept(&s, fd,
+            (struct wolfIP_sockaddr *)&peer, &peer_len);
+    ck_assert_int_ge(accepted, 0);
+
+    (void)wolfIP_poll(&s, 3);
+    ck_assert_uint_gt(last_frame_sent_count, frames_before);
+    out = llk_last_tcp();
+    ck_assert_ptr_nonnull(out);
+    ck_assert(out->flags & TCP_FLAG_ACK);
+    ck_assert_uint_eq(ee16(out->src_port), (uint16_t)LLK_LISTEN_PORT);
+    ck_assert_uint_eq(ee16(out->dst_port), 41000);
+    /* The peer's FIN at seq 2 consumed one sequence number. */
+    ck_assert_uint_eq(ee32(out->ack), 3);
+}
+END_TEST
+
+/* A listener closed while it holds a pre-accept connection keeps is_listener
+ * set through the closing states, where accept() and recv() both fail. It
+ * must not be advertised readable, or a poll() loop spins on a descriptor
+ * that can make no progress. */
+START_TEST(test_tcp_listener_closed_while_pending_is_not_readable)
+{
+    struct wolfIP s;
+    int fd;
+    struct tsocket *lsn;
+    struct wolfIP_sockaddr_in peer;
+    socklen_t peer_len = sizeof(peer);
+
+    wolfIP_init(&s);
+    mock_link_init(&s);
+    wolfIP_ipconfig_set(&s, LLK_LOCAL_IP, LLK_NET_MASK, 0);
+    fd = llk_open_listener(&s);
+    lsn = &s.tcpsockets[SOCKET_UNMARK(fd)];
+
+    llk_keep_arp_fresh(&s, LLK_ATT_IP);
+    llk_attacker_syn(&s, LLK_ATT_IP, 41000, 1, 0);
+    llk_complete_handshake(&s, lsn, LLK_ATT_IP, 41000, 1);
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_ESTABLISHED);
+    ck_assert_int_eq(wolfIP_sock_can_read(&s, fd), 1);
+
+    ck_assert_int_eq(wolfIP_sock_close(&s, fd), -WOLFIP_EAGAIN);
+    ck_assert_int_eq(lsn->sock.tcp.state, TCP_FIN_WAIT_1);
+    ck_assert_int_eq(lsn->sock.tcp.is_listener, 1);
+
+    ck_assert_int_eq(wolfIP_sock_can_read(&s, fd), 0);
+    memset(&peer, 0, sizeof(peer));
+    ck_assert_int_eq(wolfIP_sock_accept(&s, fd,
+            (struct wolfIP_sockaddr *)&peer, &peer_len), -1);
 }
 END_TEST
 
@@ -5688,10 +5905,10 @@ START_TEST(test_tcp_listener_preaccept_revert_drains_connection_state)
      * must drop, or the next connection inherits a stale segment. */
     ck_assert_int_eq(fifo_is_empty(&lsn->sock.tcp.txbuf), 0);
 
-    /* accept() fails (ESTABLISHED) and reverts the port to LISTEN. */
+    /* The established connection is handed off and the listener is reset. */
     memset(&peer, 0, sizeof(peer));
-    ck_assert_int_eq(wolfIP_sock_accept(&s, fd,
-            (struct wolfIP_sockaddr *)&peer, &peer_len), -1);
+    ck_assert_int_ge(wolfIP_sock_accept(&s, fd,
+            (struct wolfIP_sockaddr *)&peer, &peer_len), 0);
     ck_assert_int_eq(lsn->sock.tcp.state, TCP_LISTEN);
 
     /* The dead connection's transport state is gone. */
@@ -5753,10 +5970,10 @@ START_TEST(test_tcp_listener_revert_restores_option_baseline)
     llk_complete_handshake(&s, lsn, LLK_ATT_IP, 41000, 1);
     ck_assert_int_eq(lsn->sock.tcp.state, TCP_ESTABLISHED);
 
-    /* accept() fails (ESTABLISHED) and reverts the port to LISTEN. */
+    /* Late accept preserves the connection and reverts the port to LISTEN. */
     memset(&peer, 0, sizeof(peer));
-    ck_assert_int_eq(wolfIP_sock_accept(&s, fd,
-            (struct wolfIP_sockaddr *)&peer, &peer_len), -1);
+    ck_assert_int_ge(wolfIP_sock_accept(&s, fd,
+            (struct wolfIP_sockaddr *)&peer, &peer_len), 0);
     ck_assert_int_eq(lsn->sock.tcp.state, TCP_LISTEN);
 
     /* The option baseline matches a freshly allocated socket. */
