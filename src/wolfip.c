@@ -1636,6 +1636,13 @@ struct wolfIP {
 #endif
     uint16_t ipcounter;
     uint64_t last_tick;
+    /* Set by the first wolfIP_poll(). Tick comparisons wrap in 32 bits
+     * (tick_expired()), so a deadline computed before the application has
+     * handed the stack a single tick is expressed in a domain the tick
+     * source may never visit: an app whose clock starts at the epoch in
+     * milliseconds leaves last_tick + delay looking weeks into the future.
+     * Timers are therefore armed only once the tick domain is known. */
+    uint8_t tick_valid;
 #if WOLFIP_ENABLE_FORWARDING
     uint32_t route_generation;
     struct wolfIP_route_entry routes[WOLFIP_MAX_ROUTES];
@@ -13822,6 +13829,7 @@ int wolfIP_poll(struct wolfIP *s, uint64_t now)
     }
 
     s->last_tick = now;
+    s->tick_valid = 1;
 
     /* Poll the device */
 #if WOLFIP_IPV6
